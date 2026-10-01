@@ -16,11 +16,17 @@ env = os.environ.copy()
 env.pop('SSH_CONNECTION', None)
 
 def nft(script):
-    subprocess.run(['nft', '-f', '-'], input=script, text=True, check=True, capture_output=True)
+    result = subprocess.run(['nft', '-f', '-'], input=script + '\n', text=True, capture_output=True)
+    if result.returncode:
+        raise RuntimeError(result.stderr)
 
 subprocess.run(['ip', 'link', 'set', 'lo', 'up'], check=True)
 subprocess.run(['ip', '-6', 'addr', 'add', '::2/128', 'dev', 'lo'], check=True)
-nft('table inet system_test { chain input { type filter hook input priority 0; policy accept; } }')
+nft('''table inet system_test {
+    chain input {
+        type filter hook input priority 0; policy accept;
+    }
+}''')
 original = subprocess.check_output(['nft', '-nn', 'list', 'table', 'inet', 'system_test'], text=True)
 servers = []
 stop = threading.Event()
