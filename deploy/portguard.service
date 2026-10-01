@@ -1,0 +1,12 @@
+[Unit]
+Description=Restore Rathole IP allowlists
+After=local-fs.target
+Before=rathole.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/portguard -c /etc/portguard/firewall.toml apply
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,21 @@
+# VPS 自身 SSH 端口；按实际值修改。放在所有 [表] 之前。
+protected_ports = [22]
+
+# 默认 enabled=true。全局关闭也可执行 portguard disable。
+# enabled = true
+
+[rules.nas]
+ports = ["5200-5300"]
+allow = ["203.0.113.25", "198.51.100.0/24", "2001:db8::/64"]
+
+[rules.rdp]
+ports = ["33890"]
+allow = ["203.0.113.25"]
+
+[rules.public]
+ports = ["8080", "8443"]
+allow = ["*"]
+
+[rules.rathole]
+ports = ["2333"]
+allow = ["192.0.2.50"]

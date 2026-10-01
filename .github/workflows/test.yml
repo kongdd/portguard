@@ -1,0 +1,20 @@
+name: Test
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  cli:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - run: cargo build --locked
+      - run: sudo env PORTGUARD_BIN="$PWD/target/debug/portguard" python3 tests/cli_test.py
+      - run: sudo apt-get update && sudo apt-get install -y nftables iproute2
+      - name: Test real kernel in isolated namespace
+        run: sudo env PORTGUARD_BIN="$PWD/target/debug/portguard" PORTGUARD_TEST_PARENT_NS="$(readlink /proc/self/ns/net)" unshare --net python3 tests/kernel_test.py

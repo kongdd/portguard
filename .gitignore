@@ -1,0 +1,6 @@
+/target/
+/firewall.toml
+*.state.json
+*.pending.json
+*.tmp.*
+__pycache__/
