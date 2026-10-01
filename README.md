@@ -208,6 +208,6 @@ sudo env PORTGUARD_BIN="$PWD/target/debug/portguard" \
 
 ## 本次验证
 
-Rust 单元测试 15 项、CLI 端到端测试 13 项通过；rustfmt 与 Clippy 检查通过。真实内核过滤由 GitHub Actions 在隔离网络命名空间验证，覆盖 IPv4/IPv6、TCP/UDP、SSH 保护、回退以及启用日志后的过滤行为。审计解析使用构造日志测试，不把它等同于真实攻击检测。
+Rust 单元测试 17 项、CLI 端到端测试 13 项通过；rustfmt 与 Clippy 检查通过。真实内核过滤由 GitHub Actions 在隔离网络命名空间验证，覆盖 IPv4/IPv6、TCP/UDP、SSH 保护、回退以及启用日志后的过滤行为。审计解析使用构造日志测试，不把它等同于真实攻击检测。
 
 二进制包为 Linux x86_64 GNU 构建，要求 glibc ≥ 2.39（Ubuntu 24.04 及较新版本满足）；不是 Windows/macOS 或 NAS 通用安装包。其他 Linux 系统可从源码编译。

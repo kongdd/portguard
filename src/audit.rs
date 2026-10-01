@@ -1,14 +1,15 @@
+use crate::process;
 use anyhow::{Context, Result, bail};
 use clap::Args;
 use serde::Serialize;
 use serde_json::Value;
 use std::{
+    cmp::Reverse,
     collections::{BTreeMap, BTreeSet},
-    io::{BufRead, BufReader, Read},
+    io::{BufRead, BufReader},
     net::IpAddr,
-    process::{Command, Stdio},
-    thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    process::Command,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 const MAX_RECORDS: u64 = 100_000;
@@ -83,9 +84,19 @@ struct Summary {
 }
 
 enum Event {
-    Failure(IpAddr),
-    Success(IpAddr),
-    Denied(IpAddr, Option<u16>),
+    Failure,
+    Success,
+    Denied(Option<u16>),
+}
+
+fn field<'a>(record: &'a Value, name: &str) -> Option<&'a str> {
+    record.get(name)?.as_str()
+}
+
+fn packet_field<'a>(message: &'a str, prefix: &str) -> Option<&'a str> {
+    message
+        .split_whitespace()
+        .find_map(|word| word.strip_prefix(prefix))
 }
 
 fn ssh_ip(message: &str) -> Option<IpAddr> {
@@ -100,34 +111,27 @@ fn ssh_ip(message: &str) -> Option<IpAddr> {
     Some(normalize(ip))
 }
 
-fn event(v: &Value) -> Option<Event> {
-    let message = v.get("MESSAGE")?.as_str()?;
-    let identifier = v
-        .get("SYSLOG_IDENTIFIER")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    if matches!(identifier, "sshd" | "sshd-session") {
-        if message.starts_with("Failed ") {
-            return ssh_ip(message).map(Event::Failure);
+fn event(record: &Value) -> Option<(IpAddr, Event)> {
+    let message = field(record, "MESSAGE")?;
+    if matches!(
+        field(record, "SYSLOG_IDENTIFIER"),
+        Some("sshd" | "sshd-session")
+    ) {
+        let kind = if message.starts_with("Failed ") {
+            Some(Event::Failure)
+        } else if message.starts_with("Accepted ") {
+            Some(Event::Success)
+        } else {
+            None // Invalid user/PAM messages can describe the same authentication attempt.
+        };
+        if let Some(kind) = kind {
+            return Some((ssh_ip(message)?, kind));
         }
-        if message.starts_with("Accepted ") {
-            return ssh_ip(message).map(Event::Success);
-        }
-        // "Invalid user" and PAM errors can describe the SAME attempt; don't count them twice.
     }
-    if v.get("_TRANSPORT").and_then(Value::as_str) == Some("kernel")
-        && message.starts_with("portguard DROP ")
-    {
-        let source = message
-            .split_whitespace()
-            .find_map(|w| w.strip_prefix("SRC="))?
-            .parse()
-            .ok()?;
-        let port = message
-            .split_whitespace()
-            .find_map(|w| w.strip_prefix("DPT="))
-            .and_then(|s| s.parse::<u16>().ok());
-        return Some(Event::Denied(normalize(source), port));
+    if field(record, "_TRANSPORT") == Some("kernel") && message.starts_with("portguard DROP ") {
+        let ip = packet_field(message, "SRC=")?.parse().ok()?;
+        let port = packet_field(message, "DPT=").and_then(|s| s.parse().ok());
+        return Some((normalize(ip), Event::Denied(port)));
     }
     None
 }
@@ -135,27 +139,22 @@ fn event(v: &Value) -> Option<Event> {
 impl Summary {
     fn consume(&mut self, line: &str, cutoff: u64, current_time: u64) {
         self.scanned_records += 1;
-        let Ok(v) = serde_json::from_str::<Value>(line) else {
+        let parsed = serde_json::from_str::<Value>(line).ok().and_then(|record| {
+            let time = field(&record, "__REALTIME_TIMESTAMP")?
+                .parse::<u64>()
+                .ok()?
+                / 1_000_000;
+            Some((record, time))
+        });
+        let Some((record, time)) = parsed else {
             self.malformed_records += 1;
             return;
         };
-        let Some(time) = v
-            .get("__REALTIME_TIMESTAMP")
-            .and_then(Value::as_str)
-            .and_then(|s| s.parse::<u64>().ok())
-            .map(|t| t / 1_000_000)
-        else {
-            self.malformed_records += 1;
-            return;
-        };
-        if time < cutoff || time > current_time {
+        if !(cutoff..=current_time).contains(&time) {
             return;
         }
-        let Some(e) = event(&v) else {
+        let Some((ip, event)) = event(&record) else {
             return;
-        };
-        let ip = match e {
-            Event::Failure(ip) | Event::Success(ip) | Event::Denied(ip, _) => ip,
         };
         let entry = self.entries.entry(ip).or_insert_with(|| Entry {
             ip: ip.to_string(),
@@ -164,10 +163,10 @@ impl Summary {
         });
         entry.first_seen_unix = entry.first_seen_unix.min(time);
         entry.last_seen_unix = entry.last_seen_unix.max(time);
-        match e {
-            Event::Failure(_) => entry.ssh_failures += 1,
-            Event::Success(_) => entry.ssh_successes += 1,
-            Event::Denied(_, port) => {
+        match event {
+            Event::Failure => entry.ssh_failures += 1,
+            Event::Success => entry.ssh_successes += 1,
+            Event::Denied(port) => {
                 entry.denied_packets_logged += 1;
                 if let Some(port) = port {
                     entry.destination_ports.insert(port);
@@ -180,59 +179,33 @@ impl Summary {
 fn query(window: u64, timestamp: u64) -> Result<Summary> {
     let since = format!("{window} seconds ago");
     // Same-field matches are ORed; '+' ORs the SSH group with kernel messages.
-    let mut child = Command::new("journalctl")
-        .args([
-            "--no-pager",
-            "--quiet",
-            "--all",
-            "--output=json",
-            "--since",
-            &since,
-            "--lines=100000",
-            "SYSLOG_IDENTIFIER=sshd",
-            "SYSLOG_IDENTIFIER=sshd-session",
-            "+",
-            "_TRANSPORT=kernel",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("无法运行 journalctl；audit 当前需要 systemd journal（建议 sudo）")?;
-    let stdout = child.stdout.take().unwrap();
+    let mut command = Command::new("journalctl");
+    command.args([
+        "--no-pager",
+        "--quiet",
+        "--all",
+        "--output=json",
+        "--since",
+        &since,
+        "--lines=100000",
+        "SYSLOG_IDENTIFIER=sshd",
+        "SYSLOG_IDENTIFIER=sshd-session",
+        "+",
+        "_TRANSPORT=kernel",
+    ]);
     let cutoff = timestamp.saturating_sub(window);
-    let reader = thread::spawn(move || -> Result<Summary> {
-        let mut summary = Summary::default();
-        for line in BufReader::new(stdout).lines() {
-            let line = line?;
-            if !line.trim().is_empty() {
-                summary.consume(&line, cutoff, timestamp);
+    let (status, summary, errors) =
+        process::run(&mut command, "", Duration::from_secs(30), move |stdout| {
+            let mut summary = Summary::default();
+            for line in BufReader::new(stdout).lines() {
+                let line = line?;
+                if !line.trim().is_empty() {
+                    summary.consume(&line, cutoff, timestamp);
+                }
             }
-        }
-        Ok(summary)
-    });
-    let mut stderr = child.stderr.take().unwrap();
-    let errors = thread::spawn(move || {
-        let mut s = String::new();
-        stderr.read_to_string(&mut s).map(|_| s)
-    });
-    let deadline = Instant::now();
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        if deadline.elapsed() >= Duration::from_secs(30) {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!("日志查询超过 30 秒，请缩短 --since");
-        }
-        thread::sleep(Duration::from_millis(10));
-    };
-    let summary = reader
-        .join()
-        .map_err(|_| anyhow::anyhow!("日志解析线程失败"))??;
-    let errors = errors
-        .join()
-        .map_err(|_| anyhow::anyhow!("日志错误读取线程失败"))??;
+            Ok(summary)
+        })
+        .context("无法完成 journalctl 查询；检查日志权限，超时请缩短 --since")?;
     if !status.success() {
         bail!("journalctl 查询失败：{}；请检查日志权限", errors.trim());
     }
@@ -254,11 +227,9 @@ fn ranked<'a>(summary: &'a Summary, options: &Options) -> Vec<&'a Entry> {
         .collect();
     // Authentication failures are stronger evidence than dropped packet volume.
     entries.sort_by(|a, b| {
-        b.ssh_failures
-            .cmp(&a.ssh_failures)
-            .then_with(|| b.denied_packets_logged.cmp(&a.denied_packets_logged))
-            .then_with(|| b.last_seen_unix.cmp(&a.last_seen_unix))
-            .then_with(|| a.ip.cmp(&b.ip))
+        let priority =
+            |e: &Entry| Reverse((e.ssh_failures, e.denied_packets_logged, e.last_seen_unix));
+        priority(a).cmp(&priority(b)).then_with(|| a.ip.cmp(&b.ip))
     });
     entries.truncate(options.limit as usize);
     entries
@@ -279,14 +250,12 @@ pub fn run(options: &Options) -> Result<()> {
         notes.push("部分日志缺少时间戳或格式无效，已跳过。");
     }
     if options.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "since_unix": timestamp.saturating_sub(options.since), "until_unix": timestamp,
-                "scanned_records": summary.scanned_records, "malformed_records": summary.malformed_records,
-                "truncated": summary.scanned_records >= MAX_RECORDS, "entries": entries, "notes": notes,
-            }))?
-        );
+        let report = serde_json::json!({
+            "since_unix": timestamp.saturating_sub(options.since), "until_unix": timestamp,
+            "scanned_records": summary.scanned_records, "malformed_records": summary.malformed_records,
+            "truncated": summary.scanned_records >= MAX_RECORDS, "entries": entries, "notes": notes,
+        });
+        println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
     println!(
@@ -322,116 +291,4 @@ pub fn run(options: &Options) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    fn record(message: &str, ssh: bool, time: u64) -> String {
-        serde_json::json!({"MESSAGE":message,"SYSLOG_IDENTIFIER":if ssh {"sshd"} else {"kernel"},"_TRANSPORT":if ssh {"syslog"} else {"kernel"},"__REALTIME_TIMESTAMP":(time*1_000_000).to_string()}).to_string()
-    }
-    #[test]
-    fn windows() {
-        assert_eq!(parse_window("24h").unwrap(), 86400);
-        for text in [
-            "0h",
-            "31d",
-            "-1h",
-            "1;echo x",
-            "999999999999999999999d",
-            "",
-            "中文",
-        ] {
-            assert!(parse_window(text).is_err());
-        }
-    }
-    #[test]
-    fn failed_password_publickey_and_success() {
-        let mut s = Summary::default();
-        for message in [
-            "Failed password for invalid user root from 192.0.2.1 port 43000 ssh2",
-            "Failed publickey for root from 192.0.2.1 port 43000 ssh2",
-            "Accepted publickey for root from 192.0.2.1 port 43000 ssh2",
-            "Invalid user root from 192.0.2.1 port 43000",
-            "pam_unix(sshd:auth): authentication failure; rhost=192.0.2.1",
-        ] {
-            s.consume(&record(message, true, 100), 0, 200);
-        }
-        let e = &s.entries[&"192.0.2.1".parse().unwrap()];
-        assert_eq!(e.ssh_failures, 2);
-        assert_eq!(e.ssh_successes, 1);
-    }
-    #[test]
-    fn ipv6_kernel_and_untrusted_messages() {
-        let mut s = Summary::default();
-        s.consume(&record("portguard DROP IN=eth0 SRC=2001:db8::1 DST=2001:db8::2 PROTO=TCP SPT=1234 DPT=5202",false,150),0,200);
-        s.consume(
-            &record(
-                "Failed password for root from 2001:db8::1 port 43000 ssh2",
-                false,
-                150,
-            ),
-            0,
-            200,
-        );
-        s.consume(
-            &record("portguard DROP SRC=192.0.2.1 DPT=5202", true, 150),
-            0,
-            200,
-        );
-        assert_eq!(s.entries.len(), 1);
-        let e = &s.entries[&"2001:db8::1".parse().unwrap()];
-        assert_eq!(e.denied_packets_logged, 1);
-        assert!(e.destination_ports.contains(&5202));
-        assert_eq!(e.ssh_failures, 0);
-    }
-    #[test]
-    fn window_order_and_bad_logs() {
-        let mut s = Summary::default();
-        s.consume(
-            &record(
-                "Failed password for root from 192.0.2.1 port 1234 ssh2",
-                true,
-                50,
-            ),
-            100,
-            200,
-        );
-        s.consume(
-            &record(
-                "Failed password for root from 192.0.2.1 port 1234 ssh2",
-                true,
-                250,
-            ),
-            100,
-            200,
-        );
-        s.consume("not JSON", 100, 200);
-        s.consume(
-            &record(
-                "Failed password for root from 192.0.2.1 port 1234 ssh2",
-                true,
-                180,
-            ),
-            100,
-            200,
-        );
-        s.consume(
-            &record(
-                "Failed password for root from 192.0.2.1 port 1234 ssh2",
-                true,
-                110,
-            ),
-            100,
-            200,
-        );
-        assert_eq!(s.entries.len(), 1);
-        assert_eq!(s.malformed_records, 1);
-        let e = &s.entries[&"192.0.2.1".parse().unwrap()];
-        assert_eq!(e.first_seen_unix, 110);
-        assert_eq!(e.last_seen_unix, 180);
-    }
-    #[test]
-    fn username_does_not_inject_source_ip() {
-        let message =
-            "Failed password for invalid user bad from 1.1.1.1 from 192.0.2.1 port 1234 ssh2";
-        assert_eq!(ssh_ip(message).unwrap().to_string(), "192.0.2.1");
-    }
-}
+mod tests;

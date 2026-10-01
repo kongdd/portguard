@@ -1,12 +1,9 @@
-use crate::config::{Config, Network, PortRange};
-use anyhow::{Context, Result, bail};
-use std::{
-    collections::BTreeSet,
-    io::{Read, Write},
-    process::{Command, Stdio},
-    thread,
-    time::{Duration, Instant},
+use crate::{
+    config::{Config, Network, PortRange},
+    process,
 };
+use anyhow::{Context, Result, bail};
+use std::{collections::BTreeSet, process::Command, time::Duration};
 
 pub const TABLE: &str = "portguard";
 
@@ -66,51 +63,16 @@ pub fn render(c: &Config) -> Result<String> {
 
 fn run(args: &[&str], input: &str) -> Result<String> {
     // No shell: configuration strings are never executed as shell commands.
-    let mut child = Command::new("nft")
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("无法启动 nft：请安装 nftables")?;
-    let mut stdin = child.stdin.take().unwrap();
-    let bytes = input.as_bytes().to_vec();
-    let writer = thread::spawn(move || stdin.write_all(&bytes));
-    let mut stdout = child.stdout.take().unwrap();
-    let output = thread::spawn(move || {
-        let mut b = String::new();
-        stdout.read_to_string(&mut b).map(|_| b)
-    });
-    let mut stderr = child.stderr.take().unwrap();
-    let errors = thread::spawn(move || {
-        let mut b = String::new();
-        stderr.read_to_string(&mut b).map(|_| b)
-    });
-    let start = Instant::now();
-    let status = loop {
-        if let Some(s) = child.try_wait()? {
-            break s;
-        }
-        if start.elapsed() >= Duration::from_secs(10) {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!("nft 操作超过 10 秒：中止；如为应用操作，下次写入命令将先恢复事务记录");
-        }
-        thread::sleep(Duration::from_millis(10));
-    };
-    let output = output
-        .join()
-        .map_err(|_| anyhow::anyhow!("nft 输出线程失败"))??;
-    let error = errors
-        .join()
-        .map_err(|_| anyhow::anyhow!("nft 错误线程失败"))??;
-    let written = writer
-        .join()
-        .map_err(|_| anyhow::anyhow!("nft 输入线程失败"))?;
+    let (status, output, error) = process::run(
+        Command::new("nft").args(args),
+        input,
+        Duration::from_secs(10),
+        process::read_text,
+    )
+    .context("无法完成 nft 操作：请检查 nftables 安装及权限")?;
     if !status.success() {
         bail!("nft 失败（检查 root/CAP_NET_ADMIN 权限）：{}", error.trim());
     }
-    written?;
     Ok(output)
 }
 

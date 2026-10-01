@@ -1,6 +1,7 @@
 mod audit;
 mod config;
 mod nft;
+mod process;
 mod store;
 
 use anyhow::{Context, Result};
