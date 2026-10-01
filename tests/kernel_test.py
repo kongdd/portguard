@@ -73,8 +73,8 @@ def reaches(source, udp=False):
 
 with tempfile.TemporaryDirectory() as folder:
     config = Path(folder) / 'firewall.toml'
-    def write(allow, enabled=True, ports=None):
-        config.write_text('protected_ports=[22]\n[rules.test]\nenabled=' + str(enabled).lower() + '\nports=' + json.dumps(ports or ['55200-55205']) + '\nallow=' + json.dumps(allow) + '\n')
+    def write(allow, enabled=True, ports=None, logging=False):
+        config.write_text('log_denied=' + str(logging).lower() + '\nprotected_ports=[22]\n[rules.test]\nenabled=' + str(enabled).lower() + '\nports=' + json.dumps(ports or ['55200-55205']) + '\nallow=' + json.dumps(allow) + '\n')
     def cli(*args, ok=True):
         r = subprocess.run([str(binary), '-c', str(config), *args], env=env, text=True, capture_output=True)
         assert (r.returncode == 0) == ok, r.stdout + r.stderr
@@ -99,9 +99,24 @@ with tempfile.TemporaryDirectory() as folder:
     print('PASS: overlapping CIDRs merged')
     cli('rollback')
     assert_policy(True, True, 'rollback restores filtering')
-    write(['127.0.0.2'])
+    write(['127.0.0.2'], logging=True)
+    cli('check')
     cli('apply')
-    assert_policy(True, False, 'IPv4 allowlist does not permit IPv6')
+    assert_policy(True, False, 'logging preserves IPv4/IPv6 filtering')
+    rules = subprocess.check_output(['nft', '-nn', 'list', 'table', 'inet', 'portguard'], text=True)
+    assert rules.count('log prefix \"portguard DROP \"') == 1
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as burst:
+        burst.bind(('127.0.0.3', 0))
+        burst.settimeout(0.3)
+        for _ in range(100):
+            burst.sendto(b'blocked', ('127.0.0.1', 55202))
+        try:
+            burst.recv(16)
+            raise AssertionError('logging limit must not allow denied packets')
+        except TimeoutError:
+            pass
+    assert not reaches('127.0.0.3', udp=True)
+    print('PASS: exceeding logging rate limit never bypasses drop')
     cli('rollback')
     assert_policy(True, True, 'dual-stack rollback')
     old = subprocess.check_output(['nft', '-nn', 'list', 'table', 'inet', 'portguard'], text=True)

@@ -15,6 +15,8 @@ jobs:
       - run: cargo test --locked
       - run: cargo build --locked
       - run: sudo env PORTGUARD_BIN="$PWD/target/debug/portguard" python3 tests/cli_test.py
+      - name: Test real journal queries using synthetic SSH events
+        run: sudo env PORTGUARD_BIN="$PWD/target/debug/portguard" python3 tests/journal_test.py
       - run: sudo apt-get update && sudo apt-get install -y nftables iproute2
       - name: Test real kernel in isolated namespace
         run: sudo env PORTGUARD_BIN="$PWD/target/debug/portguard" PORTGUARD_TEST_PARENT_NS="$(readlink /proc/self/ns/net)" unshare --net python3 tests/kernel_test.py

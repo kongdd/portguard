@@ -7,6 +7,8 @@ use std::{collections::BTreeMap, net::IpAddr};
 pub struct Config {
     #[serde(default = "yes")]
     pub enabled: bool,
+    #[serde(default)]
+    pub log_denied: bool,
     // Required, deliberately no default: the operator must specify SSH ports.
     pub protected_ports: Vec<u16>,
     pub rules: BTreeMap<String, Rule>,

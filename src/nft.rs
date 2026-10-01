@@ -49,10 +49,18 @@ pub fn render(c: &Config) -> Result<String> {
                 if version == 4 { "ip" } else { "ip6" }
             ));
         }
-        rules.push_str(&format!("        {port_match} drop\n"));
+        rules.push_str(&format!(
+            "        {port_match} {}\n",
+            if c.log_denied { "jump denied" } else { "drop" }
+        ));
     }
+    let logging = if c.log_denied {
+        "    chain denied {\n        limit rate 5/second burst 10 packets log prefix \"portguard DROP \"\n        drop\n    }\n"
+    } else {
+        ""
+    };
     Ok(format!(
-        "table inet {TABLE} {{\n{sets}    chain input {{\n        type filter hook input priority -10; policy accept;\n{rules}    }}\n}}\n"
+        "table inet {TABLE} {{\n{sets}{logging}    chain input {{\n        type filter hook input priority -10; policy accept;\n{rules}    }}\n}}\n"
     ))
 }
 

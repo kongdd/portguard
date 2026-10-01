@@ -1,6 +1,9 @@
 # VPS 自身 SSH 端口；按实际值修改。放在所有 [表] 之前。
 protected_ports = [22]
 
+# 可选：记录被拦截来源，供 portguard audit 查询。默认 false。
+# log_denied = true
+
 # 默认 enabled=true。全局关闭也可执行 portguard disable。
 # enabled = true
 

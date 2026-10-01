@@ -167,6 +167,63 @@ class CliTests(unittest.TestCase):
         self.assertEqual(self.kernel()['acl'], '')
         self.assertIn('enabled = false', self.config.read_text())
 
+    def test_logging_is_opt_in_and_rollback_restores_it(self):
+        self.run_cli('apply')
+        self.assertNotIn('log prefix', self.kernel()['acl'])
+        text = self.config.read_text()
+        self.config.write_text('log_denied=true\n' + text)
+        self.run_cli('apply')
+        rules = self.kernel()['acl']
+        self.assertEqual(rules.count('limit rate 5/second burst 10 packets'), 1)
+        self.assertIn('jump denied', rules)
+        self.assertIn('log prefix "portguard DROP "', rules)
+        self.run_cli('rollback')
+        self.assertNotIn('log prefix', self.kernel()['acl'])
+
+    def test_audit_without_firewall_config_and_query_filters(self):
+        import time
+        fixture = self.root / 'journal.jsonl'
+        now = int(time.time())
+        rows = []
+        def row(message, ssh=True, ago=10):
+            rows.append({'MESSAGE': message, 'SYSLOG_IDENTIFIER': 'sshd' if ssh else 'kernel',
+                         '_TRANSPORT': 'syslog' if ssh else 'kernel',
+                         '__REALTIME_TIMESTAMP': str((now - ago) * 1000000)})
+        for _ in range(3):
+            row('Failed password for invalid user root from 192.0.2.1 port 1234 ssh2')
+        row('Invalid user root from 192.0.2.1 port 1234')
+        row('Accepted publickey for root from 192.0.2.1 port 1234 ssh2')
+        row('portguard DROP SRC=2001:db8::1 DST=2001:db8::2 PROTO=TCP DPT=5202', ssh=False)
+        row('Failed password for root from 198.51.100.1 port 1234 ssh2', ago=90000)
+        row('Accepted password for root from 192.0.2.2 port 1234 ssh2')
+        fixture.write_text(''.join(json.dumps(r) + '\n' for r in rows))
+        journal = self.root / 'bin' / 'journalctl'
+        journal.write_text('#!/usr/bin/env python3\nfrom pathlib import Path\nimport os,sys\nroot=Path(os.environ["FAKE_NFT_DIR"])\n(root/"journal_args").write_text(" ".join(sys.argv[1:]))\nprint((root/"journal.jsonl").read_text(),end="")\n')
+        journal.chmod(0o755)
+        self.config.unlink()  # audit must not need firewall.toml or nft.
+        result = json.loads(self.run_cli('audit', '--json'))
+        self.assertEqual(len(result['entries']), 2)
+        first = result['entries'][0]
+        self.assertEqual(first['ip'], '192.0.2.1')
+        self.assertEqual(first['ssh_failures'], 3)
+        self.assertEqual(first['ssh_successes'], 1)
+        self.assertEqual(result['entries'][1]['destination_ports'], [5202])
+        filtered = json.loads(self.run_cli('audit', '--ip', '2001:db8::1', '--json'))
+        self.assertEqual(len(filtered['entries']), 1)
+        minimum = json.loads(self.run_cli('audit', '--min-events', '3', '--limit', '1', '--json'))
+        self.assertEqual(len(minimum['entries']), 1)
+        self.assertIn('SYSLOG_IDENTIFIER=sshd + _TRANSPORT=kernel',
+                      (self.root/'journal_args').read_text().replace(' SYSLOG_IDENTIFIER=sshd-session', ''))
+        self.run_cli('audit', '--since', '中文', ok=False)
+        self.run_cli('audit', '--limit', '0', ok=False)
+
+    def test_audit_errors_are_not_reported_as_no_attacks(self):
+        journal = self.root / 'bin' / 'journalctl'
+        journal.write_text('#!/bin/sh\necho "permission denied" >&2\nexit 1\n')
+        journal.chmod(0o755)
+        self.config.unlink()
+        self.assertIn('permission denied', self.run_cli('audit', ok=False))
+
     def test_no_history_and_unowned_table(self):
         self.run_cli('rollback', ok=False)
         (self.root / 'kernel.json').write_text(json.dumps({'system': 'unchanged', 'acl': 'table inet portguard {}\n'}))

@@ -1,3 +1,4 @@
+mod audit;
 mod config;
 mod nft;
 mod store;
@@ -17,6 +18,8 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Action {
+    /// 按 IP 查询 SSH 登录失败和防火墙拦截日志
+    Audit(audit::Options),
     /// 校验配置和 nftables 规则，不改变防火墙
     Check {
         /// 输出生成的 nftables 规则
@@ -137,6 +140,9 @@ fn status(store: &store::Store, ip: Option<IpAddr>) -> Result<()> {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if let Action::Audit(options) = &cli.command {
+        return audit::run(options);
+    }
     let path = cli
         .config
         .canonicalize()
@@ -144,6 +150,7 @@ fn main() -> Result<()> {
     let store = store::Store { path };
     let session = std::env::var("SSH_CONNECTION").ok();
     match cli.command {
+        Action::Audit(_) => unreachable!("audit handled before loading firewall config"),
         Action::Check { print, config_only } => {
             let config = Config::parse(&store.text()?)?;
             config.protect_ssh_session(session.as_deref())?;

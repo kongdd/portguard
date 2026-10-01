@@ -61,7 +61,7 @@ allow = ["192.0.2.50"]
 
 `allow` 必须填写。端口须为 1–65535。规则间或同一规则内的端口范围重叠均报错；关闭的规则仍参与配置校验。中文名称使用 `[rules."办公室"]`。
 
-## 五个命令
+## 常用命令
 
 ```bash
 sudo portguard check                # 配置 + nft -c 校验，不改变规则
@@ -69,6 +69,7 @@ sudo portguard apply                # 应用修改
 sudo portguard status               # 配置与实际生效状态
 sudo portguard rollback             # 回退上一版成功配置
 sudo portguard disable              # 取消全部限制，并保存 enabled=false
+sudo portguard audit                # 最近 24 小时的登录失败/拦截来源排行
 ```
 
 默认读取当前目录的 `firewall.toml`，所有命令支持 `-c`：
@@ -88,6 +89,50 @@ sudo portguard status --ip 203.0.113.25  # 查看该 IP 匹配哪些条目
 添加/删除 IP：直接编辑 `allow`，然后 `apply`。同一 IP 若仍被其他 CIDR 覆盖，删除单 IP 后仍然允许访问。
 
 `status` 会提示配置尚未应用、专用表被外部修改、重启后丢失以及未完成事务。`--ip` 判断的是上次成功配置，不检测云安全组或其他防火墙。无成功记录时仅显示配置预览。
+
+## 查询频繁登录和被拦截的 IP
+
+```bash
+sudo portguard audit                         # 最近 24 小时，前 20 个 IP
+sudo portguard audit --since 1h --limit 30    # 最近一小时
+sudo portguard audit --since 7d --min-events 10
+sudo portguard audit --ip 203.0.113.25        # 单个 IP
+sudo portguard audit --json                  # 结构化输出
+```
+
+按 SSH 失败次数优先排序，显示每个 IP 的登录失败/成功次数、拦截包日志数、被访问端口和最近出现时间。查询不需要 firewall.toml，不改变规则、不自动封禁；最长查询 30 天，最多分析最近 100000 条相关 journal 记录，达到上限会提示。
+
+来源是 systemd journal：
+
+- SSH 认证日志（sshd/sshd-session）：统计 `Failed ... from IP port ...` 与 `Accepted ...`；同一尝试伴随的 Invalid user、PAM 错误不重复计数。
+- 内核防火墙日志：只统计本工具的 `portguard DROP` 记录，不把普通 rathole 连接错误算作攻击。
+
+默认不开启拦截日志。如需查看被拦截的来源，在 TOML **顶层、所有表之前**增加：
+
+```toml
+protected_ports = [22]
+log_denied = true
+
+[rules.nas]
+ports = ["5200-5300"]
+allow = ["203.0.113.25"]
+```
+
+然后 `sudo portguard apply`。全部规则共用一个日志限速器：每秒最多 5 条、初始突发 10 条；日志超限仍然丢弃数据包，不会放行。journald/内核也可能再次限速，因此拦截数只代表实际记录的包数，不是连接数或完整攻击次数。没有历史记录时不能追溯过去流量。
+
+查看原始记录：
+
+```bash
+sudo journalctl -u ssh -u sshd --since "1 hour ago"
+sudo journalctl -k --since "1 hour ago" --grep 'portguard DROP'
+sudo journalctl -u rathole --since "1 hour ago"  # 使用 systemd 服务时的运行日志
+```
+
+部分发行版还把 SSH 日志写入 `/var/log/auth.log` 或 `/var/log/secure`，本版 audit 只读取 journal。SSH 服务单元名称可能不同，audit 用 sshd 的日志标识检索，不依赖固定服务名。
+
+rathole 的隧道连接、认证和转发错误不等于映射服务遭到攻击。经 rathole 转发到内网 SSH 的认证失败记录在**内网机器**；其连接来源通常是 rathole 客户端，不能直接当作公网攻击者。公网 VPS 的拦截日志仍可记录实际访问 VPS 的来源。
+
+失败登录也可能来自正常用户；成功登录应结合账号核查。没有查询结果不代表没有攻击，日志可能未启用、已过期或当前用户无读取权限。`audit` 不检测所有端口、应用漏洞或已经入侵的程序。
 
 ## SSH 保护
 
@@ -163,6 +208,6 @@ sudo env PORTGUARD_BIN="$PWD/target/debug/portguard" \
 
 ## 本次验证
 
-Rust 单元测试 10 项、CLI 端到端测试 10 项通过；rustfmt 与 Clippy 检查通过。当前执行环境没有 CAP_NET_ADMIN，不能创建网络命名空间，真实内核过滤测试未在本环境执行。部署前建议在 Linux 测试机或 GitHub Actions 运行附带测试。
+Rust 单元测试 15 项、CLI 端到端测试 13 项通过；rustfmt 与 Clippy 检查通过。真实内核过滤由 GitHub Actions 在隔离网络命名空间验证，覆盖 IPv4/IPv6、TCP/UDP、SSH 保护、回退以及启用日志后的过滤行为。审计解析使用构造日志测试，不把它等同于真实攻击检测。
 
 二进制包为 Linux x86_64 GNU 构建，要求 glibc ≥ 2.39（Ubuntu 24.04 及较新版本满足）；不是 Windows/macOS 或 NAS 通用安装包。其他 Linux 系统可从源码编译。
