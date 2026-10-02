@@ -188,12 +188,14 @@ fn import(conn: Connection, start: u64, end: u64) -> Result<(Connection, u64)> {
 
 fn summarize(conn: &Connection, start: u64, end: u64, ip: Option<IpAddr>) -> Result<Summary> {
     let (start, end) = (i64::try_from(start)?, i64::try_from(end)?);
-    let mut summary = Summary::default();
-    summary.scanned_records = conn.query_row(
-        "SELECT COUNT(*) FROM audit_records WHERE ts BETWEEN ?1 AND ?2",
-        params![start, end],
-        |row| u64_or_zero(row, 0),
-    )?;
+    let mut summary = Summary {
+        scanned_records: conn.query_row(
+            "SELECT COUNT(*) FROM audit_records WHERE ts BETWEEN ?1 AND ?2",
+            params![start, end],
+            |row| u64_or_zero(row, 0),
+        )?,
+        ..Summary::default()
+    };
     let filter = ip.map(|ip| ip.to_string());
     let condition = if filter.is_some() {
         "AND ip=?3"

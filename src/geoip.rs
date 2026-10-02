@@ -102,7 +102,7 @@ fn compact_address(address: &str) -> String {
 }
 
 fn address_from_response(response: &Value, ip: IpAddr) -> Option<String> {
-    if response.get("success")?.as_bool()? != true
+    if !response.get("success")?.as_bool()?
         || response.get("ip")?.as_str()?.parse::<IpAddr>().ok()? != ip
     {
         return None;
