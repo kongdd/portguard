@@ -96,15 +96,48 @@ sudo portguard status --ip 203.0.113.25  # 查看该 IP 匹配哪些条目
 sudo portguard audit                         # 最近 24 小时，前 20 个 IP
 sudo portguard audit --since 1h --limit 30    # 最近一小时
 sudo portguard audit --since 7d --min-events 10
+sudo portguard audit --since 1y              # 最近一年（365 天），也可写 365d
 sudo portguard audit --ip 203.0.113.25        # 单个 IP
 sudo portguard audit --json                  # 结构化输出
+sudo portguard audit --min-events 0          # 也显示仅有成功登录的 IP
+sudo portguard audit --no-geo                # 不向第三方发送公网 IP、不联网查询属地
+sudo portguard audit index --since 1y        # 预解析一年日志，建立/更新索引
+sudo portguard audit index --since 1y --rebuild # 重建索引（只读取 journal）
+sudo portguard audit --no-index              # 绕过索引，直接读取 journal 进行核对
 ```
 
-按 SSH 失败次数优先排序，显示每个 IP 的登录失败/成功次数、拦截包日志数、被访问端口和最近出现时间。查询不需要 firewall.toml，不改变规则、不自动封禁；最长查询 30 天，最多分析最近 100000 条相关 journal 记录，达到上限会提示。
+按 `fail` 列倒序（可加 `--sort` 切换），显示每个 IP 的登录失败/成功次数、无效用户日志数、连接断开/重置日志数、拦截包日志数、被访问端口和最近出现时间。`--min-events` 的门槛包含失败、无效用户、断开、重置和拦截日志，默认 1；设置为 0 也显示仅成功登录的 IP。查询不需要 firewall.toml，不改变规则、不自动封禁；最长查询 1 年（365 天），默认使用持久化 SQLite 索引，首次查询流式解析指定时间范围内全部相关 journal 记录，不设置日志条数上限；后续自动增量更新并从索引按精确秒级时间范围统计。`--limit` 只限制展示的 IP 数，不限制统计日志量。每次 journal 解析最长运行 300 秒，超时或读取失败会回滚索引更新并报错，不返回截断的部分统计。可查询的历史取决于 journal 的实际保留时间，不保证保留一年日志。
+
+普通终端输出只保留查询标题和表格，不重复显示统计口径、属地隐私或启用日志的说明；相关说明见本节。遇到格式无效的记录时，仅向 stderr 输出简短 `Warning`。`--json` 保持原结构，详细说明仍在 `notes` 中；兼容字段 `truncated` 现在固定为 `false`，表示不再按日志条数截断。
+
+表头统一小写：`ip` / `address` / `fail` / `ok` / `invalid` / `closed` / `reset` / `last`。`last` 自动选择 `sec`、`min`、`hour`、`day`、`mon`，取整显示，数字右对齐、单位左对齐；`mon` 按 30 天计算。JSON 仍保留完整字段名和 Unix 秒时间戳。
+
+默认按 `fail` 列倒序（与历史行为一致），可用 `--sort <column>` 切换为其他列的倒序，例如 `audit --sort invalid`、`audit --sort reset`、`audit --sort last`（最新优先）。`--sort` 也接受小写表头名称，如 `ip`、`address`、`closed`。`--sort ip` 按 IP 地址数值倒序排列，而不是按字符串排序；混合地址族时 IPv6 排在 IPv4 前。`--sort address` 先为所有符合门槛的候选 IP 填充属地，再按属地字符串倒序排列并应用 `--limit`；属地相同时按 IP 字符串升序排列。属地查询预算仍然有效，未查询或查询失败的候选使用 `Unknown` 参与排序；`--no-geo` 时全部显示 `-`，按 IP 打破平局。
+
+`Address` 默认通过 `curl` 向 `https://ipwho.is` 查询（需要安装 curl），使用中文结果：中国大陆 IP 显示“省份 / 城市”，其他 IP 显示“国家 / 城市”，国外城市名最多保留前 4 个字，国内城市名不受此限制（表格和 JSON 都适用）。内网、回环和保留地址分别标注 `Private`、`Loopback`、`Reserved`，不会发送给第三方；公网查询失败、超时或超过本次查询预算显示 `Unknown`。属地是服务商估算，不代表精确位置或攻击者国籍。`--no-geo` 禁用属地查询及缓存读取，地址显示 `-`。
+
+属地成功缓存 7 天、失败缓存 10 分钟。root 默认缓存路径 `/var/cache/portguard/geoip.json`，普通用户使用 `$XDG_CACHE_HOME/portguard/geoip.json`（或 `~/.cache/portguard/geoip.json`）；可用 `--geo-cache PATH` 指定。每次最多查询 32 个未缓存公网 IP，4 路并发，总调度预算 8 秒，最后一批最多另需 3 秒；失败不会影响日志统计。表格属地最多占 24 个显示列，超长用省略号截断，JSON 的 `address` 不受表格的 24 列宽限制，国外城市仍最多保留 4 个字。在线查询会将公网 IP 发给第三方，仅用于展示，不改变防火墙。
+
+### audit 索引
+
+root 默认索引路径 `/var/cache/portguard/audit.sqlite3`，普通用户与属地缓存使用同一个缓存目录。可通过 `--index-path PATH` 指定其他数据库；索引文件以 `600` 权限新建，不保存原始日志正文，只保存 journal 游标、时间、解析出的 IP、事件类型和目标端口。按时间、IP 建数据库索引，复用与展示条数无关，`--ip` 不会导致其他 IP 被漏建索引。
+
+- `audit index --since 1y` 预建索引，默认一年；普通 `audit` 首次只建立本次需要的范围。
+- 覆盖范围扩大时只补读尚未解析的历史区间；平时只读取上次快照之后的新日志及边界秒，使用 `__CURSOR` 去重，避免增量重复计数。即使本次查询范围缩小，也会补齐索引快照之间的空档。
+- SQLite 事务和写锁保证更新、覆盖范围标记一起提交，失败回滚；同一路径的并发更新会等待，不会重复累计。索引绑定机器和有效用户身份，不能静默复用其他机器或权限范围的数据。
+- 索引保留已解析的最近 365 天记录，journal 轮转后仍能查询这些历史；从未解析、已经被 journal 删除的历史不能补回。导入旧 journal、改变日志读取权限或修改解析口径后应执行 `audit index --rebuild`，重新扫描当前可访问的日志。
+- `--no-index` 完全绕过索引，直接解析当前 journal；源日志已轮转时，其结果可能少于保留历史的索引。损坏或不兼容的索引会明确报错，不会静默返回旧数据；版本不兼容可用 `--rebuild`，数据库物理损坏可指定新的 `--index-path` 重建。
+- JSON 新增 `index` 信息（路径、索引覆盖起止时间、总记录数、本次新增解析记录数）；`--no-index` 时为 `null`。`audit index --json` 输出索引状态，不查询属地。
+
+构建 release 后可运行 `python3 tests/index_bench.py`，用 50 万条合成日志核对索引与直接解析的统计一致性及查询速度；不会读取/修改真实 journal，不联网，也不改变防火墙。
+
+### 日志来源与统计口径
 
 来源是 systemd journal：
 
-- SSH 认证日志（sshd/sshd-session）：统计 `Failed ... from IP port ...` 与 `Accepted ...`；同一尝试伴随的 Invalid user、PAM 错误不重复计数。
+在 journal 保留数据不变且使用相同查询截止时间时，同一 IP 的 `100d` 统计应不小于 `30d`，但不同时间范围的前 20 名可能是不同 IP，比较时可用 `--ip` 指定同一来源。表格默认展示前 20 个符合门槛的 IP，不是所有 IP。`Fail` 只统计明确的 `Failed` 认证失败；禁用密码认证时，扫描可能仅留下 `Invalid`、`Closed` 或 `Reset`，不能把它们硬算成认证失败。仅成功登录的 IP 需要 `--min-events 0`，查看完整来源列表还应增大 `--limit`。
+
+- SSH 日志（sshd/sshd-session）：分别统计 `Failed ... from IP port ...`、`Accepted ...`、`Invalid user ...`、`Connection closed by ... IP port ...` 和 `Connection reset by ... IP port ...`。无效用户、断开、重置不算作认证失败；同一连接可能产生多类日志，不能相加当作独立连接或攻击次数。正常客户端也可能断开或重置，需结合频率、账号和时间分析。无来源 IP 的 KEX/PAM 错误不归属到某个 IP，避免猜测或重复计数。
 - 内核防火墙日志：只统计本工具的 `portguard DROP` 记录，不把普通 rathole 连接错误算作攻击。
 
 默认不开启拦截日志。如需查看被拦截的来源，在 TOML **顶层、所有表之前**增加：

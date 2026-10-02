@@ -1,5 +1,6 @@
 mod audit;
 mod config;
+mod geoip;
 mod nft;
 mod process;
 mod store;
@@ -19,7 +20,7 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Action {
-    /// 按 IP 查询 SSH 登录失败和防火墙拦截日志
+    /// 按 IP 查询 SSH 登录、异常连接和防火墙拦截日志
     Audit(audit::Options),
     /// 校验配置和 nftables 规则，不改变防火墙
     Check {
