@@ -5,6 +5,8 @@ use std::{
     fs::{self, OpenOptions},
     os::unix::fs::OpenOptionsExt,
     path::Path,
+    thread,
+    time::Instant,
 };
 
 fn u64_or_zero(row: &Row, index: usize) -> rusqlite::Result<u64> {
@@ -20,6 +22,7 @@ fn u16_or_zero(row: &Row, index: usize) -> rusqlite::Result<u16> {
 const APPLICATION_ID: i64 = 0x50474155; // PGAU
 const SCHEMA_VERSION: i64 = 1;
 const RETENTION: u64 = 365 * 86400;
+const LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 
 unsafe extern "C" {
     fn geteuid() -> u32;
@@ -75,11 +78,51 @@ fn open(path: &Path, rebuild: bool) -> Result<Connection> {
         .truncate(false)
         .mode(0o600)
         .open(path)?;
+    open_with_retry(path, rebuild, LOCK_TIMEOUT)
+}
+
+fn open_with_retry(path: &Path, rebuild: bool, timeout: Duration) -> Result<Connection> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        // A fresh connection drops any partially started transaction or read
+        // snapshot before retrying, so contenders cannot keep each other locked.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match initialize(path, rebuild, remaining.min(Duration::from_millis(100))) {
+            Ok(conn) => return Ok(conn),
+            Err(error) => {
+                let busy = error
+                    .downcast_ref::<rusqlite::Error>()
+                    .is_some_and(|error| {
+                        matches!(
+                            error.sqlite_error_code(),
+                            Some(
+                                rusqlite::ErrorCode::DatabaseBusy
+                                    | rusqlite::ErrorCode::DatabaseLocked
+                            )
+                        )
+                    });
+                if !busy || Instant::now() >= deadline {
+                    return Err(error).context("audit 索引初始化失败或锁等待超时");
+                }
+                thread::sleep(
+                    Duration::from_millis(10)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
+        }
+    }
+}
+
+fn initialize(path: &Path, rebuild: bool, busy_timeout: Duration) -> Result<Connection> {
     let conn = Connection::open(path)?;
-    conn.busy_timeout(Duration::from_secs(30))?;
-    // Reject unrelated databases before changing their journal mode. Recheck
-    // under the writer lock in case another process initialized the file.
+    conn.busy_timeout(busy_timeout)?;
+    // Read all header fields in one snapshot; another initializer may commit
+    // between individual queries otherwise. Do not change unrelated databases.
+    conn.execute_batch("BEGIN;")?;
     validate_header(&conn, rebuild)?;
+    conn.execute_batch("COMMIT;")?;
+    // WAL mode changes can return SQLITE_BUSY without invoking the busy handler.
+    // The caller retries the entire initialization with a fresh connection.
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; BEGIN IMMEDIATE;")?;
     validate_header(&conn, rebuild)?;
     if rebuild {
@@ -121,6 +164,7 @@ fn open(path: &Path, rebuild: bool) -> Result<Connection> {
     }
     conn.pragma_update(None, "application_id", APPLICATION_ID)?;
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    conn.busy_timeout(LOCK_TIMEOUT)?;
     Ok(conn)
 }
 

@@ -566,20 +566,29 @@ if (root/"index_fail").exists():
             self.index_row('failed', 'Failed password for root from 192.0.2.1 port 1234 ssh2', now - 10),
             self.index_row('ok', 'Accepted publickey for root from 192.0.2.1 port 1234 ssh2', now),
         ])
-        db = self.root / 'audit.sqlite3'
-        command = [str(BINARY), 'audit', '--index-path', str(db), '--no-geo', '--json']
-        workers = [subprocess.Popen(command, env=self.env, text=True, stdout=subprocess.PIPE,
-                                    stderr=subprocess.PIPE) for _ in range(2)]
-        reports = []
-        for worker in workers:
-            stdout, stderr = worker.communicate(timeout=20)
-            self.assertEqual(worker.returncode, 0, stdout + stderr)
-            reports.append(json.loads(stdout))
-        for report in reports:
-            self.assertEqual(report['entries'][0]['ssh_failures'], 1)
-            self.assertEqual(report['entries'][0]['ssh_successes'], 1)
-            self.assertEqual(report['scanned_records'], 2)
-        self.assertEqual(sum(report['index']['imported_records'] for report in reports), 2)
+        # Repeated cold starts exercise WAL conversion as well as the writer lock.
+        for attempt in range(5):
+            with self.subTest(attempt=attempt):
+                db = self.root / f'concurrent-{attempt}.sqlite3'
+                command = [str(BINARY), 'audit', '--index-path', str(db), '--no-geo', '--json']
+                workers = [subprocess.Popen(command, env=self.env, text=True, stdout=subprocess.PIPE,
+                                            stderr=subprocess.PIPE) for _ in range(8)]
+                reports = []
+                try:
+                    for worker in workers:
+                        stdout, stderr = worker.communicate(timeout=40)
+                        self.assertEqual(worker.returncode, 0, stdout + stderr)
+                        reports.append(json.loads(stdout))
+                finally:
+                    for worker in workers:
+                        if worker.poll() is None:
+                            worker.kill()
+                        worker.communicate()
+                for report in reports:
+                    self.assertEqual(report['entries'][0]['ssh_failures'], 1)
+                    self.assertEqual(report['entries'][0]['ssh_successes'], 1)
+                    self.assertEqual(report['scanned_records'], 2)
+                self.assertEqual(sum(report['index']['imported_records'] for report in reports), 2)
 
     def test_audit_index_failure_does_not_commit_rows_or_coverage(self):
         now = int(time.time())

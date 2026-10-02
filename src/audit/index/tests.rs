@@ -108,6 +108,64 @@ fn failed_updates_and_rebuilds_rollback_atomically() {
 }
 
 #[test]
+fn initialization_waits_for_wal_mode_lock() {
+    let db = Database::new();
+    let blocker = Connection::open(&db.0).unwrap();
+    // Create a valid SQLite file with an empty, unclaimed schema, then hold
+    // a reader snapshot that prevents conversion from DELETE mode to WAL.
+    blocker
+        .execute_batch("CREATE TABLE held(value); DROP TABLE held;")
+        .unwrap();
+    blocker
+        .execute_batch("BEGIN; SELECT * FROM sqlite_master;")
+        .unwrap();
+    let path = db.0.clone();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+    let worker = thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        let conn = open_with_retry(&path, false, Duration::from_secs(2)).unwrap();
+        conn.execute_batch("COMMIT").unwrap();
+        finished_tx.send(()).unwrap();
+    });
+    started_rx.recv().unwrap();
+    assert!(matches!(
+        finished_rx.recv_timeout(Duration::from_millis(100)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
+    blocker.execute_batch("COMMIT").unwrap();
+    worker.join().unwrap();
+    finished_rx.recv().unwrap();
+    let conn = open(&db.0, false).unwrap();
+    let mode: String = conn
+        .pragma_query_value(None, "journal_mode", |r| r.get(0))
+        .unwrap();
+    assert_eq!(mode, "wal");
+}
+
+#[test]
+fn initialization_lock_wait_is_bounded() {
+    let db = Database::new();
+    let blocker = Connection::open(&db.0).unwrap();
+    blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+    let started = Instant::now();
+    let error = open_with_retry(&db.0, false, Duration::from_millis(100)).unwrap_err();
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(error.to_string().contains("锁等待超时"));
+    assert_eq!(
+        error
+            .downcast_ref::<rusqlite::Error>()
+            .unwrap()
+            .sqlite_error_code(),
+        Some(rusqlite::ErrorCode::DatabaseBusy)
+    );
+    blocker.execute_batch("ROLLBACK").unwrap();
+    // A timed-out attempt must not leave a transaction or lock behind.
+    let conn = open(&db.0, false).unwrap();
+    conn.execute_batch("COMMIT").unwrap();
+}
+
+#[test]
 fn incompatible_and_unrelated_databases_are_not_silently_reused() {
     let db = Database::new();
     {
