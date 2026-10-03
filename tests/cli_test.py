@@ -85,6 +85,38 @@ print(json.dumps({"success":True,"ip":ip,"country_code":"AU" if foreign else "CN
         self.assertIn('192.0.2.1/32', self.kernel()['acl'])
         self.assertEqual(self.kernel()['system'], 'unchanged')
 
+    def test_config_permissions_and_owner_are_preserved(self):
+        for mode in (0o640, 0o664):
+            with self.subTest(mode=oct(mode)):
+                self.write(['192.0.2.1'])
+                def mapped(kind, identity):
+                    return any(start <= identity < start + count
+                               for start, _, count in
+                               (map(int, line.split()) for line in
+                                Path(f'/proc/self/{kind}_map').read_text().splitlines()))
+
+                if os.geteuid() == 0 and mapped('uid', 65534) and mapped('gid', 65534):
+                    # CI root can test a different owner; single-user namespaces
+                    # cannot chown to an unmapped identity.
+                    os.chown(self.config, 65534, 65534)
+                self.config.chmod(mode)
+                before = self.config.stat()
+
+                def assert_metadata():
+                    after = self.config.stat()
+                    self.assertEqual(after.st_uid, before.st_uid)
+                    self.assertEqual(after.st_gid, before.st_gid)
+                    self.assertEqual(after.st_mode & 0o7777, mode)
+
+                self.run_cli('apply')
+                assert_metadata()
+                self.assertEqual(self.config.stat().st_ino, before.st_ino)
+                self.run_cli('disable')
+                assert_metadata()
+                self.run_cli('rollback')
+                assert_metadata()
+                self.run_cli('disable')
+
     def test_protection_and_overlap_leave_kernel_untouched(self):
         self.run_cli('apply')
         old = self.kernel()
@@ -298,7 +330,7 @@ print(json.dumps({"success":True,"ip":ip,"country_code":"AU" if foreign else "CN
         self.run_cli('audit', '--since', '中文', ok=False)
         self.run_cli('audit', '--limit', '0', ok=False)
         self.run_cli('audit', '--sort', 'FAIL', ok=False)
-        self.run_cli('audit', '--sort', 'drop', ok=False)
+        self.run_cli('audit', '--sort', 'drop', ok=True)
         self.run_cli('audit', '--sort', 'ports', ok=False)
         self.run_cli('audit', '--sort', 'ip', ok=True)
         self.assertEqual(json.loads(self.run_cli('audit', '--sort', 'invalid', '--json'))['sort'], 'invalid')
@@ -375,6 +407,29 @@ print(json.dumps({"success":True,"ip":ip,"country_code":"AU" if foreign else "CN
                 self.assertIn('192.0.2.9', self.run_cli(*args))
                 self.assertEqual(len(json.loads(self.run_cli(*args, '--min-events', '2', '--json'))['entries']), 1)
                 self.assertEqual(json.loads(self.run_cli(*args, '--min-events', '3', '--json'))['entries'], [])
+
+    def test_audit_drop_column_and_sort(self):
+        now = int(time.time())
+        self.write_index_journal([
+            self.index_row(f'drop-{i}',
+                           f'portguard DROP IN=eth0 SRC={ip} DST=203.0.113.1 PROTO=TCP DPT=23',
+                           now - 10, kernel=True)
+            for i, ip in enumerate(['192.0.2.1', '192.0.2.2', '192.0.2.2'])
+        ])
+        for mode in [('--no-index',), ('--index-path', str(self.root / 'drop.sqlite3'))]:
+            with self.subTest(mode=mode):
+                args = ('audit', *mode, '--sort', 'drop', '--no-geo')
+                report = json.loads(self.run_cli(*args, '--json'))
+                self.assertEqual([e['ip'] for e in report['entries']], ['192.0.2.2', '192.0.2.1'])
+                table = self.run_cli(*args).splitlines()
+                header = [cell.strip() for cell in table[1].split('|')]
+                self.assertEqual(header[-2:], ['drop', 'last'])
+                self.assertEqual(len(header), 9)
+                rows = [[cell.strip() for cell in line.split('|')] for line in table[3:5]]
+                self.assertEqual([row[7] for row in rows], ['2', '1'])
+                limited = json.loads(self.run_cli(*args, '--json', '--limit', '1'))
+                self.assertEqual(limited['entries'][0]['ip'], '192.0.2.2')
+                self.assertEqual(len(limited['entries']), 1)
 
     def test_audit_ip_sort_is_numeric_descending(self):
         now = int(time.time())

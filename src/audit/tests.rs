@@ -16,6 +16,7 @@ fn table_aligns_english_ipv6_counts_ports_and_recent_time() {
     let first = Entry {
         ip: "192.0.2.1".into(),
         ssh_failures: 2,
+        denied_packets_logged: 43,
         last_seen_unix: 99_999,
         ..Entry::default()
     };
@@ -41,6 +42,9 @@ fn table_aligns_english_ipv6_counts_ports_and_recent_time() {
             assert_eq!(cell.len(), label.len());
         }
     }
+    assert_eq!(header.len(), 9);
+    assert_eq!(header[7].trim(), "drop");
+    assert_eq!(lines[2].split(" | ").nth(7).unwrap(), "  43");
     assert_eq!(lines[2].split(" | ").nth(2).unwrap(), "        2");
     assert_eq!(lines[2].split(" | ").last().unwrap(), "1 sec ");
     assert_eq!(lines[3].split(" | ").last().unwrap(), "1 day ");
@@ -226,7 +230,7 @@ fn connection_samples_and_ranking() {
     assert_eq!(last_order[0].ip, "192.0.2.2");
     options.sort = "reset".into();
     assert!(ranked(&s, &options).unwrap().len() >= 2);
-    for bad in ["FAIL", "", "auth", "ip_address", "drop", "ports"] {
+    for bad in ["FAIL", "", "auth", "ip_address", "ports"] {
         options.sort = bad.into();
         assert!(ranked(&s, &options).is_err(), "expected error for {bad}");
     }

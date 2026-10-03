@@ -47,7 +47,7 @@ pub struct Options {
     /// 索引数据库路径（默认 root 使用 /var/cache/portguard/audit.sqlite3）
     #[arg(long, global = true)]
     pub index_path: Option<PathBuf>,
-    /// 按列名排序（小写）：ip/address/fail/ok/invalid/closed/reset/last
+    /// 按列名排序（小写）：ip/address/fail/ok/invalid/closed/reset/drop/last
     #[arg(long, global = true, default_value = "fail")]
     pub sort: String,
     #[command(subcommand)]
@@ -319,6 +319,7 @@ enum Column {
     Invalid,
     Closed,
     Reset,
+    Drop,
     Last,
 }
 
@@ -331,8 +332,9 @@ fn parse_column(text: &str) -> Result<Column, String> {
         "invalid" => Ok(Column::Invalid),
         "closed" => Ok(Column::Closed),
         "reset" => Ok(Column::Reset),
+        "drop" => Ok(Column::Drop),
         "last" => Ok(Column::Last),
-        _ => Err("--sort 支持 ip/address/fail/ok/invalid/closed/reset/last（小写）".into()),
+        _ => Err("--sort 支持 ip/address/fail/ok/invalid/closed/reset/drop/last（小写）".into()),
     }
 }
 
@@ -362,6 +364,7 @@ fn ranked<'a>(summary: &'a Summary, options: &Options) -> Result<Vec<&'a Entry>>
                 Column::Invalid => (entry.ssh_invalid_users, 0),
                 Column::Closed => (entry.ssh_connection_closed, 0),
                 Column::Reset => (entry.ssh_connection_reset, 0),
+                Column::Drop => (entry.denied_packets_logged, 0),
                 Column::Last => (entry.last_seen_unix, 0),
             })
         };
@@ -432,7 +435,7 @@ fn short_address(text: &str) -> String {
 
 fn render_table(entries: &[&Entry], timestamp: u64) -> String {
     let headers = [
-        "ip", "address", "fail", "ok", "invalid", "closed", "reset", "last",
+        "ip", "address", "fail", "ok", "invalid", "closed", "reset", "drop", "last",
     ];
     let ages: Vec<_> = entries
         .iter()
@@ -443,7 +446,7 @@ fn render_table(entries: &[&Entry], timestamp: u64) -> String {
         .map(|(number, _)| number.to_string().len())
         .max()
         .unwrap_or(1);
-    let rows: Vec<[String; 8]> = entries
+    let rows: Vec<[String; 9]> = entries
         .iter()
         .zip(&ages)
         .map(|(entry, (number, unit))| {
@@ -459,6 +462,7 @@ fn render_table(entries: &[&Entry], timestamp: u64) -> String {
                 entry.ssh_invalid_users.to_string(),
                 entry.ssh_connection_closed.to_string(),
                 entry.ssh_connection_reset.to_string(),
+                entry.denied_packets_logged.to_string(),
                 format!("{number:>age_number_width$} {unit:<4}"),
             ]
         })

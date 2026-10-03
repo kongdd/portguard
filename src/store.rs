@@ -4,12 +4,16 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
     io::Write,
-    os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
+    os::{
+        fd::AsRawFd,
+        unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    },
     path::{Path, PathBuf},
 };
 
 unsafe extern "C" {
     fn flock(fd: i32, operation: i32) -> i32;
+    fn fchown(fd: i32, owner: u32, group: u32) -> i32;
 }
 
 // Global lock: multiple config files must not concurrently replace the same table.
@@ -28,6 +32,11 @@ pub fn lock() -> Result<File> {
 }
 
 pub fn atomic(path: &Path, text: &str) -> Result<()> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
     // O_EXCL avoids following a pre-existing temporary symlink.
     let mut name = path.as_os_str().to_os_string();
     name.push(format!(".tmp.{}", std::process::id()));
@@ -41,6 +50,18 @@ pub fn atomic(path: &Path, text: &str) -> Result<()> {
             .open(&temporary)?;
         created = true;
         file.write_all(text.as_bytes())?;
+        if let Some(metadata) = &metadata {
+            let temporary_metadata = file.metadata()?;
+            if (temporary_metadata.uid(), temporary_metadata.gid())
+                != (metadata.uid(), metadata.gid())
+                && unsafe { fchown(file.as_raw_fd(), metadata.uid(), metadata.gid()) } != 0
+            {
+                return Err(std::io::Error::last_os_error())
+                    .context("无法保留原文件所有者，未替换文件");
+            }
+            // chown may clear permission bits, so restore permissions afterwards.
+            file.set_permissions(fs::Permissions::from_mode(metadata.mode() & 0o7777))?;
+        }
         file.sync_all()?;
         fs::rename(&temporary, path)?;
         sync_parent(path)?;
@@ -186,7 +207,10 @@ impl Store {
                 config_text: text.clone(),
                 rules: nft::snapshot()?,
             };
-            atomic(&self.path, &text)?;
+            // Applying an unchanged draft must not replace its inode or metadata.
+            if text != journal.old_disk {
+                atomic(&self.path, &text)?;
+            }
             atomic(
                 &self.side(".state.json"),
                 &serde_json::to_string_pretty(&State { current, previous })?,
