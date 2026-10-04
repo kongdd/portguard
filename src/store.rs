@@ -23,7 +23,10 @@ pub fn lock() -> Result<File> {
         .truncate(false)
         .write(true)
         .mode(0o600)
-        .open("/run/lock/portguard.lock")
+        .open(
+            std::env::var("PORTGUARD_LOCK")
+                .unwrap_or_else(|_| "/run/lock/portguard.lock".to_string()),
+        )
         .context("无法取得锁，请使用 sudo")?;
     if unsafe { flock(file.as_raw_fd(), 2 | 4) } != 0 {
         bail!("另一个 portguard 操作正在执行，请稍后重试");

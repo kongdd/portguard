@@ -8,7 +8,13 @@ mod store;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use config::Config;
-use std::{net::IpAddr, path::PathBuf};
+use std::{
+    io::{Write, stderr, stdout},
+    net::IpAddr,
+    path::PathBuf,
+    thread,
+    time::Duration,
+};
 
 #[derive(Parser)]
 #[command(version, about = "端口/IP 白名单管理；只操作专用 nftables 表")]
@@ -31,8 +37,15 @@ enum Action {
         #[arg(long)]
         config_only: bool,
     },
-    /// 应用配置；无需重启 rathole
-    Apply,
+    /// 应用配置；无需重启 rathole。加 --watch 后持续热载文件变化。
+    Apply {
+        /// 应用当前文件后继续监视，内容稳定变化时再次应用
+        #[arg(long)]
+        watch: bool,
+        /// 轮询间隔（毫秒）。两次读到相同新内容后才应用，避免写到一半。
+        #[arg(long, default_value_t = 500)]
+        interval_ms: u64,
+    },
     /// 查看配置、实际规则和上一版状态
     Status {
         /// 判断给定 IP 在各规则下是否可访问
@@ -110,23 +123,33 @@ fn status(store: &store::Store, ip: Option<IpAddr>) -> Result<()> {
     for (name, rule) in &display.rules {
         let allow = if !display.enabled || !rule.enabled {
             "未限制".into()
-        } else if rule.allow == ["*"] {
+        } else if rule.allows_any() {
             "*（全部来源）".into()
         } else if rule.allow.is_empty() {
             "拒绝全部".into()
         } else {
-            rule.allow.join(", ")
+            rule.allow
+                .iter()
+                .map(|entry| {
+                    if entry.note().is_empty() {
+                        entry.ip().to_string()
+                    } else {
+                        format!("{}（{}）", entry.ip(), entry.note())
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
         };
         print!("{name}\t{}\t{allow}", rule.ports.join(", "));
         if let Some(ip) = ip {
             let matched = rule
                 .allow
                 .iter()
-                .find(|s| config::Network::parse(s).is_ok_and(|n| n.contains(ip)));
-            let result = if !display.enabled || !rule.enabled || rule.allow == ["*"] {
+                .find(|s| config::Network::parse(s.ip()).is_ok_and(|n| n.contains(ip)));
+            let result = if !display.enabled || !rule.enabled || rule.allows_any() {
                 "不受限制".into()
             } else if let Some(matched) = matched {
-                format!("允许，匹配 {matched}")
+                format!("允许，匹配 {}", matched.ip())
             } else {
                 "拒绝".into()
             };
@@ -140,6 +163,119 @@ fn status(store: &store::Store, ip: Option<IpAddr>) -> Result<()> {
     Ok(())
 }
 
+fn note(message: &str) {
+    let _ = writeln!(stderr(), "{message}");
+    let _ = stderr().flush();
+}
+fn report(message: &str) {
+    let _ = writeln!(stdout(), "{message}");
+    let _ = stdout().flush();
+}
+fn apply_once(store: &store::Store, session: Option<&str>) -> Result<()> {
+    let _lock = store::lock()?;
+    store.recover()?;
+    if store.apply(store.text()?, session)? {
+        report(&format!(
+            "已应用：{}；rathole 无需重启",
+            store.path.display()
+        ));
+    } else {
+        report("配置与实际规则未变，无需重新应用");
+    }
+    Ok(())
+}
+fn watch(store: &store::Store, session: Option<&str>, interval_ms: u64) -> Result<()> {
+    let interval = Duration::from_millis(interval_ms.clamp(100, 60_000));
+    note(&format!(
+        "监视 {}；新内容连续稳定 {} ms 后应用。无效配置不会改变现有规则。",
+        store.path.display(),
+        interval.as_millis()
+    ));
+    let mut seen = String::new();
+    let mut reported = String::new();
+    // Apply the file already on disk, then only react to a later stable change.
+    match store.text() {
+        Ok(text) => reconcile(store, session, text, &mut seen, &mut reported),
+        Err(error) => remember(
+            &mut reported,
+            &format!("读取配置失败，保留现有规则：{error:#}"),
+        ),
+    }
+    loop {
+        thread::sleep(interval);
+        let text = match store.text() {
+            Ok(text) => text,
+            Err(error) => {
+                remember(
+                    &mut reported,
+                    &format!("读取配置失败，保留现有规则：{error:#}"),
+                );
+                continue;
+            }
+        };
+        if text == seen {
+            continue;
+        }
+        thread::sleep(interval);
+        match store.text() {
+            Ok(stable) if stable == text => {
+                reconcile(store, session, stable, &mut seen, &mut reported)
+            }
+            Ok(_) => {}
+            Err(error) => remember(
+                &mut reported,
+                &format!("读取配置失败，保留现有规则：{error:#}"),
+            ),
+        }
+    }
+}
+// Called under the global lock, after recovery. Never substitute a newer,
+// unconfirmed draft for the content that passed the stability check.
+fn stable_text(store: &store::Store, expected: &str) -> Result<Option<String>> {
+    let current = store.text()?;
+    Ok((current == expected).then_some(current))
+}
+fn reconcile(
+    store: &store::Store,
+    session: Option<&str>,
+    text: String,
+    seen: &mut String,
+    reported: &mut String,
+) {
+    if text == *seen {
+        return;
+    }
+    let result = (|| {
+        let _lock = store::lock()?;
+        store.recover()?;
+        match stable_text(store, &text)? {
+            Some(stable) => store.apply(stable, session).map(Some),
+            None => Ok(None),
+        }
+    })();
+    match result {
+        Ok(None) => {} // File changed: wait for another pair of stable reads.
+        Ok(Some(changed)) => {
+            *seen = text;
+            reported.clear();
+            if changed {
+                report(&format!(
+                    "已应用：{}；rathole 无需重启",
+                    store.path.display()
+                ));
+            } else {
+                report("配置与实际规则未变，无需重新应用");
+            }
+        }
+        Err(error) => remember(reported, &format!("未应用，防火墙保持原样：{error:#}")),
+    }
+}
+fn remember(reported: &mut String, message: &str) {
+    if reported != message {
+        note(message);
+        *reported = message.to_string();
+    }
+}
 fn main() -> Result<()> {
     let cli = Cli::parse();
     if let Action::Audit(options) = &cli.command {
@@ -184,15 +320,11 @@ fn main() -> Result<()> {
             let _lock = store::lock()?;
             status(&store, ip)?;
         }
-        Action::Apply => {
-            let _lock = store::lock()?;
-            store.recover()?;
-            if store.apply(store.text()?, session.as_deref())? {
-                println!("已应用：{}；rathole 无需重启", store.path.display());
-            } else {
-                println!("配置与实际规则未变，无需重新应用");
-            }
-        }
+        Action::Apply {
+            watch: true,
+            interval_ms,
+        } => watch(&store, session.as_deref(), interval_ms)?,
+        Action::Apply { watch: false, .. } => apply_once(&store, session.as_deref())?,
         Action::Rollback => {
             let _lock = store::lock()?;
             store.recover()?;
@@ -207,4 +339,39 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod watch_tests {
+    use super::*;
+    use std::{fs, time::SystemTime};
+
+    #[test]
+    fn newer_or_recovered_content_must_pass_stability_check_again() {
+        let path = std::env::temp_dir().join(format!(
+            "portguard-watch-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = store::Store { path: path.clone() };
+        fs::write(&path, "confirmed draft").unwrap();
+        assert_eq!(
+            stable_text(&store, "confirmed draft").unwrap(),
+            Some("confirmed draft".into())
+        );
+        // An editor's atomic replacement (or recovery) happens after the two reads.
+        let replacement = path.with_extension("replacement");
+        fs::write(&replacement, "new unconfirmed draft").unwrap();
+        fs::rename(&replacement, &path).unwrap();
+        assert_eq!(stable_text(&store, "confirmed draft").unwrap(), None);
+        assert_eq!(
+            stable_text(&store, "new unconfirmed draft").unwrap(),
+            Some("new unconfirmed draft".into())
+        );
+        fs::remove_file(&path).unwrap();
+        assert!(stable_text(&store, "new unconfirmed draft").is_err());
+    }
 }

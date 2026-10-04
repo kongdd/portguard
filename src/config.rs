@@ -20,7 +20,44 @@ pub struct Rule {
     #[serde(default = "yes")]
     pub enabled: bool,
     pub ports: Vec<String>,
-    pub allow: Vec<String>,
+    pub allow: Vec<AllowEntry>,
+}
+
+impl Rule {
+    pub fn allows_any(&self) -> bool {
+        self.allow.len() == 1 && self.allow[0].ip() == "*"
+    }
+}
+
+/// Old string entries remain valid; a label lives beside its IP in an inline table.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum AllowEntry {
+    Plain(String),
+    Noted(NotedIp),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct NotedIp {
+    pub ip: String,
+    #[serde(default)]
+    pub note: String,
+}
+
+impl AllowEntry {
+    pub fn ip(&self) -> &str {
+        match self {
+            Self::Plain(ip) => ip,
+            Self::Noted(entry) => &entry.ip,
+        }
+    }
+    pub fn note(&self) -> &str {
+        match self {
+            Self::Plain(_) => "",
+            Self::Noted(entry) => &entry.note,
+        }
+    }
 }
 
 fn yes() -> bool {
@@ -144,13 +181,19 @@ impl Config {
             if rule.allow.len() > 4096 {
                 bail!("规则 {name}：allow 数量不能超过 4096");
             }
-            if rule.allow.iter().any(|a| a == "*") {
+            for entry in &rule.allow {
+                let note = entry.note();
+                if note.chars().count() > 128 || note.chars().any(char::is_control) {
+                    bail!("规则 {name}：IP 备注不能含控制字符，且须不超过 128 个字符");
+                }
+            }
+            if rule.allow.iter().any(|a| a.ip() == "*") {
                 if rule.allow.len() != 1 {
                     bail!("规则 {name}：'*' 不能与其他 IP 混写");
                 }
             } else {
                 for a in &rule.allow {
-                    Network::parse(a).with_context(|| format!("规则 {name}"))?;
+                    Network::parse(a.ip()).with_context(|| format!("规则 {name}"))?;
                 }
             }
             for text in &rule.ports {
@@ -204,6 +247,45 @@ mod tests {
         .unwrap();
         assert!(c.enabled);
         assert!(c.rules["办公室"].enabled);
+    }
+    #[test]
+    fn ip_notes_are_optional_and_roundtrip() {
+        let old = parse("[rules.a]\nports=['5200']\nallow=['192.0.2.1']").unwrap();
+        assert_eq!(old.rules["a"].allow[0].note(), "");
+        let c = parse("[rules.a]\nports=['5200']\nallow=[{ ip='192.0.2.1', note='家里' }, { ip='2001:db8::/64', note='办公室 IPv6' }, '198.51.100.10']").unwrap();
+        assert_eq!(c.rules["a"].allow[0].note(), "家里");
+        assert_eq!(Config::parse(&toml::to_string(&c).unwrap()).unwrap(), c);
+        let mut without_notes = c.clone();
+        for entry in &mut without_notes.rules.get_mut("a").unwrap().allow {
+            *entry = AllowEntry::Plain(entry.ip().to_string());
+        }
+        assert_eq!(
+            crate::nft::render(&c).unwrap(),
+            crate::nft::render(&without_notes).unwrap()
+        );
+    }
+    #[test]
+    fn invalid_ip_notes_fail() {
+        for entry in [
+            "{ ip='invalid', note='地址错误' }".to_string(),
+            "{ note='缺少 IP' }".to_string(),
+            "{ ip='192.0.2.1', note=123 }".to_string(),
+            "{ ip='192.0.2.1', note='家里', typo=true }".to_string(),
+            format!("{{ ip='192.0.2.1', note='{}' }}", "长".repeat(129)),
+            "{ ip='192.0.2.1', note=\"bad\\nlabel\" }".to_string(),
+        ] {
+            assert!(parse(&format!("[rules.a]\nports=['5200']\nallow=[{entry}]")).is_err());
+        }
+        assert!(
+            parse("[rules.a]\nports=['5200']\nallow=[{ ip='*', note='全部' }, '192.0.2.1']")
+                .is_err()
+        );
+        assert!(
+            parse("[rules.a]\nports=['5200']\nallow=[{ ip='*', note='全部' }]")
+                .unwrap()
+                .rules["a"]
+                .allows_any()
+        );
     }
     #[test]
     fn missing_and_unknown_fields_fail() {

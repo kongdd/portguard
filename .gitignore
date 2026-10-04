@@ -4,3 +4,7 @@
 *.pending.json
 *.tmp.*
 __pycache__/
+/UI/node_modules/
+/UI/dist/
+/UI/dist-server/
+*.ui-auth.json

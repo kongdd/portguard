@@ -1,0 +1,13 @@
+[Unit]
+Description=Apply portguard rules when firewall.toml changes
+After=local-fs.target network-pre.target
+Before=rathole.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/portguard -c /etc/portguard/firewall.toml apply --watch
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

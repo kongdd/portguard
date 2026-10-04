@@ -64,6 +64,63 @@ print(json.dumps({"success":True,"ip":ip,"country_code":"AU" if foreign else "CN
     def kernel(self):
         return json.loads((self.root / 'kernel.json').read_text())
 
+    def test_watch_applies_stable_changes_and_keeps_rules_on_invalid_edit(self):
+        env = self.env.copy()
+        env['PORTGUARD_LOCK'] = str(self.root / 'portguard.lock')
+        process = subprocess.Popen([str(BINARY), '-c', str(self.config), 'apply', '--watch', '--interval-ms', '100'], env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            self.wait_acl(lambda acl: '192.0.2.1/32' in acl)
+            self.write(['192.0.2.8'])
+            self.wait_acl(lambda acl: '192.0.2.8/32' in acl)
+            kept = self.kernel()['acl']
+            self.config.write_text('this is not toml\n')
+            time.sleep(0.6)
+            self.assertEqual(self.kernel()['acl'], kept)
+            self.write(['192.0.2.9'])
+            self.wait_acl(lambda acl: '192.0.2.9/32' in acl)
+            self.assertNotIn('192.0.2.8/32', self.kernel()['acl'])
+        finally:
+            process.terminate()
+            out, err = process.communicate(timeout=5)
+        self.assertIn('未应用，防火墙保持原样', err)
+        self.assertIn('已应用', out)
+
+    def wait_acl(self, predicate, timeout=5):
+        end = time.time() + timeout
+        last = ''
+        while time.time() < end:
+            last = self.kernel()['acl'] if (self.root / 'kernel.json').exists() else ''
+            if predicate(last):
+                return last
+            time.sleep(0.05)
+        self.fail(f'规则未在时限内更新：{last}')
+
+    def test_ip_notes_apply_status_rollback_and_disable(self):
+        text = '''protected_ports=[22]
+[rules.nas]
+ports=["5200-5300"]
+allow=[{ ip="192.0.2.1", note="家里" }, { ip="2001:db8::/64", note="办公室 IPv6" }, "198.51.100.10"]
+'''
+        self.config.write_text(text)
+        self.run_cli('apply')
+        acl = self.kernel()['acl']
+        self.assertIn('192.0.2.1/32', acl)
+        self.assertIn('2001:db8::/64', acl)
+        self.assertNotIn('家里', acl)
+        status = self.run_cli('status', '--ip', '192.0.2.1')
+        self.assertIn('192.0.2.1（家里）', status)
+        self.assertIn('允许，匹配 192.0.2.1', status)
+        self.config.write_text(text.replace('家里', '家里备用线路'))
+        self.run_cli('apply')
+        self.assertEqual(self.kernel()['acl'], acl)
+        self.assertIn('家里备用线路', self.run_cli('status'))
+        self.run_cli('rollback')
+        self.assertIn('note="家里"', self.config.read_text())
+        self.run_cli('disable')
+        self.assertIn('家里', self.config.read_text())
+        self.assertIn('办公室 IPv6', self.config.read_text())
+        self.run_cli('check', '--config-only')
+
     def test_apply_status_rollback_disable(self):
         self.run_cli('check', '--print')
         self.run_cli('apply')

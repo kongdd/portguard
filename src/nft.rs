@@ -3,7 +3,7 @@ use crate::{
     process,
 };
 use anyhow::{Context, Result, bail};
-use std::{collections::BTreeSet, process::Command, time::Duration};
+use std::{collections::BTreeSet, path::Path, process::Command, time::Duration};
 
 pub const TABLE: &str = "portguard";
 
@@ -15,7 +15,7 @@ pub fn render(c: &Config) -> Result<String> {
     let mut sets = String::new();
     let mut rules = String::new();
     for (i, (_, rule)) in c.rules.iter().enumerate() {
-        if !rule.enabled || rule.allow == ["*"] {
+        if !rule.enabled || rule.allows_any() {
             continue;
         }
         let ports = rule
@@ -28,7 +28,7 @@ pub fn render(c: &Config) -> Result<String> {
         let networks = rule
             .allow
             .iter()
-            .map(|a| Network::parse(a))
+            .map(|a| Network::parse(a.ip()))
             .collect::<Result<Vec<_>>>()?;
         for version in [4, 6] {
             let elements: BTreeSet<_> = networks
@@ -61,10 +61,26 @@ pub fn render(c: &Config) -> Result<String> {
     ))
 }
 
+fn nft() -> Command {
+    // Prefer PATH so tests can inject a fake nft. Root shells on Debian often omit /usr/sbin.
+    if let Some(path) = std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
+            .map(|dir| dir.join("nft"))
+            .find(|candidate| candidate.is_file())
+    }) {
+        return Command::new(path);
+    }
+    Command::new(
+        ["/usr/sbin/nft", "/sbin/nft"]
+            .into_iter()
+            .find(|path| Path::new(path).is_file())
+            .unwrap_or("nft"),
+    )
+}
 fn run(args: &[&str], input: &str) -> Result<String> {
     // No shell: configuration strings are never executed as shell commands.
     let (status, output, error) = process::run(
-        Command::new("nft").args(args),
+        nft().args(args),
         input,
         Duration::from_secs(10),
         process::read_text,

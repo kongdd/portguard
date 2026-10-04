@@ -2,7 +2,7 @@
 
 [![Test](https://github.com/kongdd/portguard/actions/workflows/test.yml/badge.svg)](https://github.com/kongdd/portguard/actions/workflows/test.yml)
 
-一个 Rust CLI，用 TOML 管理端口范围的 IP 白名单。独立于 rathole，只维护专用的 nftables 表。修改后执行 `apply`，无需重启 rathole，无需常驻进程。
+一个 Rust CLI，用 TOML 管理端口范围的 IP 白名单。独立于 rathole，只维护专用的 nftables 表。修改后执行 `apply`，无需重启 rathole。`apply --watch` 会在应用后继续监视文件并热载。
 
 ## 快速使用
 
@@ -32,7 +32,11 @@ protected_ports = [22]
 
 [rules.nas]
 ports = ["5200-5300"]
-allow = ["203.0.113.25", "198.51.100.0/24", "2001:db8::/64"]
+allow = [
+    { ip = "203.0.113.25", note = "家里" },
+    { ip = "198.51.100.0/24", note = "办公室" },
+    { ip = "2001:db8::/64", note = "办公室 IPv6" },
+]
 
 [rules.rdp]
 ports = ["33890"]
@@ -61,6 +65,8 @@ allow = ["192.0.2.50"]
 
 `allow` 必须填写。端口须为 1–65535。规则间或同一规则内的端口范围重叠均报错；关闭的规则仍参与配置校验。中文名称使用 `[rules."办公室"]`。
 
+IP/CIDR 可以写成 `{ ip = "203.0.113.25", note = "家里" }`，备注紧挨地址；也支持原来的纯字符串格式，两种写法可混用。`note` 可省略或留空，最多 128 个字符，不能含控制字符。备注只用于识别，不改变白名单匹配；UI 可在每个地址旁直接编辑，CLI `status` 也会显示。删除地址时备注随该项一同删除。
+
 ### IP 与 CIDR 网段
 
 `allow` 支持单个 IP 和 CIDR 网段。`/16`、`/24` 表示 IP 地址前多少位固定，末尾的 `0` 不是范围大小；**斜杠后的数字越大，网段范围越小**。
@@ -79,7 +85,8 @@ allow = ["192.0.2.50"]
 
 ```bash
 sudo portguard check                # 配置 + nft -c 校验，不改变规则
-sudo portguard apply                # 应用修改
+sudo portguard apply                # 应用一次
+sudo portguard apply --watch        # 应用后持续热载配置变化
 sudo portguard status               # 配置与实际生效状态
 sudo portguard rollback             # 回退上一版成功配置
 sudo portguard disable              # 取消全部限制，并保存 enabled=false
@@ -90,7 +97,10 @@ sudo portguard audit                # 最近 24 小时的登录失败/拦截来�
 
 ```bash
 sudo portguard -c /etc/portguard/firewall.toml apply
+sudo portguard -c /etc/portguard/firewall.toml apply --watch --interval-ms 500
 ```
+
+`apply` 本身就是热载：用一次 nftables 事务替换专用表，rathole 不用重启。不加 `--watch` 时进程随即退出，适合手工执行或脚本调用。`--watch` 先应用当前文件，再按路径重新读取，编辑器原子替换也能发现；新内容必须连续两次相同才应用，避免写到一半。配置无效、校验失败或会锁死当前 SSH 端口时，只报错并保留正在生效的规则，进程继续等待下一次修改。它和单次 `apply` 使用同一把锁。`--interval-ms` 限制在 100–60000。可用 `deploy/portguard-watch.service` 开机运行；不需要持续热载时，仍用单次 `apply`。
 
 辅助选项：
 
@@ -216,7 +226,7 @@ sudo nft delete table inet portguard
 
 规则按协议与端口匹配；同端口的其他进程也会受影响。适用于宿主机/host 网络监听，Docker bridge 的端口发布不属于本版过滤范围。不按连接状态跳过 ACL，因此移除 IP 后会过滤该来源已有连接的后续入站数据包。
 
-工具独立使用，不读取或修改 rathole 配置，不提供 TypeScript 网页端。本版先完成 CLI，后续页面可调用相同配置与操作。
+工具独立使用，不读取或修改 rathole 配置。可选的 [TypeScript 网页管理端](UI/README.md) 放在 `UI/`，提供规则编辑、配置校验和保存，并检测当前浏览器的出口 IPv4/IPv6。页面不调用应用、回退或关闭限制命令；保存后的配置由独立运行的 `apply --watch` 热载。管理服务默认监听 `0.0.0.0:7500`，使用明文 HTTP 和初始账号 `admin/123456`，请立即改密并限制访问来源；也可设 `PORTGUARD_UI_BIND=127.0.0.1` 配合 SSH 隧道。
 
 ## 开机恢复（可选）
 
