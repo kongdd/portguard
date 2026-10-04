@@ -7,7 +7,7 @@ import { readJson, withRequestErrors } from './http.js';
 import { mkdtemp, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { parseConfig, serializeConfig, normalizeIp, allowIp, allowNote, setAllowNote, portError, addressError, matchesRule } from './policy.js';
+import { parseConfig, serializeConfig, normalizeIp, allowIp, allowNote, setAllowNote, portError, addressError, matchesRule, createRule, appendIp } from './policy.js';
 import { watchStatus } from './watch.js';
 import { authenticate, defaultAuth, hashPassword, loadAuth, saveAuth, verifyPassword, DEFAULT_PASSWORD, DEFAULT_USER } from './auth.js';
 test('配置默认值及中文、IPv6、空白名单往返', () => {
@@ -56,6 +56,27 @@ test('即时校验端口和双栈 CIDR，搜索支持 IP 与备注', () => {
   const rule = { enabled: true, ports: ['8080'], allow: [{ ip: '192.0.2.1', note: '家里 Home' }] };
   for (const query of ['NAS', '8080', '192.0.2', '家里', 'home']) assert.ok(matchesRule('nas', rule, query));
   assert.equal(matchesRule('nas', rule, '办公室'), false);
+});
+
+test('添加规则一次填全，策略显式选择，添加 IP 不改端口或开关', () => {
+  const c = parseConfig('protected_ports=[22]\n[rules.home]\nports=["8080"]\nallow=["192.0.2.1"]');
+  const created = createRule(c, 'NAS', '5200-5300, 33890', '203.0.113.25 家里\n2001:db8::/64 办公室 IPv6', 'restricted');
+  assert.deepEqual(created.rule.ports, ['5200-5300', '33890']);
+  assert.deepEqual(created.rule.allow[0], { ip: '203.0.113.25', note: '家里' });
+  for (const [ports, sources, access] of [['', '192.0.2.2', 'restricted'], ['22', '192.0.2.2', 'restricted'], ['8080', '192.0.2.2', 'restricted'], ['5200-5300 5299', '192.0.2.2', 'restricted'], ['5200', '', 'restricted'], ['5200', '*', 'restricted']]) {
+    assert.throws(() => createRule(c, 'NAS', ports, sources, access));
+  }
+  assert.throws(() => createRule(c, 'home', '5200', '192.0.2.2', 'restricted'));
+  assert.deepEqual(createRule(c, 'public', '5200', '', 'public').rule.allow, ['*']);
+  assert.deepEqual(createRule(c, 'deny', '5200', '', 'deny').rule.allow, []);
+  const original = { ...c.rules.home, enabled: false };
+  const updated = appendIp(original, '192.0.2.8', '办公室');
+  assert.equal(updated.enabled, false);
+  assert.deepEqual(updated.ports, original.ports);
+  assert.equal(original.allow.length, 1);
+  assert.deepEqual(updated.allow[1], { ip: '192.0.2.8', note: '办公室' });
+  assert.throws(() => appendIp(original, '192.0.2.1', '重复'));
+  assert.throws(() => appendIp(original, '*', '公开'));
 });
 
 test('热载状态区分等待、成功、失败和失联，保留最后成功时间', () => {

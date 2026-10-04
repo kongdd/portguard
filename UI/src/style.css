@@ -105,7 +105,7 @@ input[aria-invalid="true"] { border-color: var(--bad); background: var(--bad-bg)
 .split { display: grid; grid-template-columns: 320px minmax(0, 1fr); min-height: 620px; border: 1px solid var(--line); background: #fff; align-items: stretch; }
 .rule-list { border-right: 1px solid var(--line); background: #fbf8f3; min-width: 0; }
 .list-head, .detail-head, .panel-head { height: 52px; margin: 0; padding: 0 12px; display: flex; align-items: center; gap: 8px; border-bottom: 1px solid var(--line); }
-.list-head { display: grid; grid-template-columns: minmax(0, 1fr) 64px; }
+.list-head { display: grid; grid-template-columns: minmax(0, 1fr) 96px; }
 .rule-item { width: 100%; height: 60px; text-align: left; border: 0; border-bottom: 1px solid var(--line); background: transparent; padding: 0 12px; display: grid; grid-template-columns: minmax(0, 1fr) 88px; grid-template-rows: 22px 18px; column-gap: 8px; align-content: center; }
 .rule-item strong { grid-column: 1; grid-row: 1; }
 .rule-item small { grid-column: 1; grid-row: 2; }
@@ -154,6 +154,15 @@ th:nth-child(1), td:nth-child(1) { width: 22%; }
 th:nth-child(2), td:nth-child(2) { width: 28%; }
 td.mono, .mono { font-family: ui-monospace, monospace; font-size: 13px; }
 .card pre { margin: 0; padding: 16px; border-top: 1px solid var(--line); white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.7; }
+.create-form { width: min(720px, 100%); padding: 20px; border: 1px solid var(--line); background: #fff; display: grid; gap: 16px; }
+.create-form label { display: grid; gap: 6px; }
+.create-form select { width: 100%; height: 36px; padding: 0 10px; font: inherit; color: inherit; background: #fff; border: 1px solid #cfc6b8; }
+.create-form .compact-textarea { min-height: 128px; height: 128px; }
+.create-form .quick { margin-top: 8px; }
+.create-form .form-actions { height: auto; min-height: 52px; padding: 12px 0 0; flex-wrap: wrap; }
+.form-warning, .form-error { padding: 10px 12px; font-size: 13px; background: var(--warn-bg); overflow-wrap: anywhere; }
+.form-error { color: var(--bad); background: var(--bad-bg); }
+.form-warning:empty, .form-error:empty { display: none; }
 .account { width: min(480px, 100%); background: #fff; border: 1px solid var(--line); padding: 0; }
 .account h3, .account p, .account label { margin: 16px 16px 0; }
 .account label input { margin-top: 6px; }
@@ -187,7 +196,7 @@ td.mono, .mono { font-family: ui-monospace, monospace; font-size: 13px; }
   .side { position: sticky; top: 0; z-index: 6; padding: 8px; }
   .lockup, .side-foot { display: none; }
   .nav { flex-direction: row; }
-  .nav button { flex: 1; text-align: center; }
+  .nav button { flex: 1; text-align: center; padding: 0 6px; font-size: 13px; }
   .top { top: 56px; }
   .view, .top, .banner { padding-left: 12px; padding-right: 12px; }
   .watch-status, .draft-hint { margin-left: 12px; margin-right: 12px; }

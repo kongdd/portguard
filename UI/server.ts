@@ -160,5 +160,5 @@ createServer(withRequestErrors(async (req, res) => {
   } finally { busy = false; }
 })).listen(port, bind, () => {
   console.log('Portguard UI: http://' + bind + ':' + port);
-  if (auth.users.some(u => !u.changed)) console.warn('仍在使用初始密码 admin / 123456，登录后请立即修改');
+  if (auth.users.some(u => !u.changed)) console.warn('仍在使用初始密码，登录后请立即修改');
 });

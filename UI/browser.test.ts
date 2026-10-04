@@ -36,13 +36,15 @@ async function page(cached: string | null = null, text = initial) {
   const input = (id: string, value: string) => { const node = get(id) as unknown as HTMLInputElement; node.value = value; node.dispatchEvent(new window.Event('input', { bubbles: true })); };
   const click = (id: string) => (get(id) as unknown as HTMLButtonElement).click();
   window.eval(script);
-  await waitFor(() => !!get('address-0') && !(get('console') as unknown as HTMLElement).inert);
+  await waitFor(() => !!get('path').textContent && !(get('console') as unknown as HTMLElement).inert);
   return { window, state, get, input, click, close: async () => { await window.happyDOM.abort(); window.close(); } };
 }
 
 test('刷新恢复会话，按备注/IP 搜索，检测完成后可加入当前 IP', async t => {
   const p = await page(); t.after(p.close);
   assert.equal(p.get('login-screen').hidden, true);
+  assert.doesNotMatch(p.get('login-screen').textContent!, /123456/);
+  assert.equal((p.get('pass') as unknown as HTMLInputElement).type, 'password');
   assert.equal((p.get('save') as unknown as HTMLButtonElement).disabled, true);
   p.input('filter', '家里'); assert.equal(p.window.document.querySelectorAll('.rule-item').length, 1);
   p.input('filter', '198.51.100'); assert.equal(p.window.document.querySelector('.rule-item strong')?.textContent, 'office');
@@ -129,6 +131,91 @@ test('刷新恢复待输入草稿，磁盘冲突时不覆盖，离开页面有�
   assert.match(conflict.get('draft-hint').textContent!, /磁盘配置已变化/);
   conflict.click('save'); await waitFor(() => !(conflict.get('console') as unknown as HTMLElement).inert);
   assert.equal(conflict.state.saved, 0); assert.match(conflict.state.text, /8081/);
+});
+
+test('菜单分别添加完整规则或 IP；新规则一次填写并保存', async t => {
+  const p = await page(); t.after(p.close);
+  p.window.document.querySelector<HTMLButtonElement>('[data-view="add-rule"]')!.click();
+  await waitFor(() => !p.get('view-add-rule').hidden && !(p.get('console') as unknown as HTMLElement).inert);
+  p.input('create-name', 'NAS'); p.input('create-ports', '5200-5300, 33890');
+  p.input('create-sources', '203.0.113.25 家里\n2001:db8::/64 办公室');
+  p.click('create-rule-save'); await waitFor(() => p.state.saved === 1);
+  const c = parseConfig(p.state.text);
+  assert.deepEqual(c.rules.NAS.ports, ['5200-5300', '33890']);
+  assert.deepEqual(c.rules.NAS.allow[0], { ip: '203.0.113.25', note: '家里' });
+  assert.deepEqual(c.rules.home, parseConfig(initial).rules.home);
+});
+
+test('添加规则阻止冲突端口，不会创建空白名单或半成品规则', async t => {
+  const p = await page(); t.after(p.close);
+  p.window.document.querySelector<HTMLButtonElement>('[data-view="add-rule"]')!.click();
+  await waitFor(() => !(p.get('console') as unknown as HTMLElement).inert);
+  p.input('create-name', 'NAS'); p.input('create-ports', '22'); p.input('create-sources', '192.0.2.8');
+  p.click('create-rule-save'); await waitFor(() => !!p.get('create-rule-error').textContent);
+  assert.match(p.get('create-rule-error').textContent!, /SSH/);
+  assert.equal(p.state.saved, 0); assert.equal(p.window.document.querySelectorAll('.rule-item').length, 2);
+  p.input('create-ports', '5200'); p.input('create-sources', ''); p.click('create-rule-save');
+  await waitFor(() => !(p.get('console') as unknown as HTMLElement).inert);
+  assert.equal(p.state.saved, 0); assert.equal(p.window.document.querySelectorAll('.rule-item').length, 2);
+});
+
+test('添加 IP 选择已有规则，保留端口和关闭状态，备注一起保存', async t => {
+  const p = await page(null, initial.replace('[rules.office]', '[rules.office]\nenabled=false')); t.after(p.close);
+  p.window.document.querySelector<HTMLButtonElement>('[data-view="add-ip"]')!.click();
+  await waitFor(() => !p.get('view-add-ip').hidden && !(p.get('console') as unknown as HTMLElement).inert);
+  p.input('create-target', 'office'); p.input('create-ip', '203.0.113.88'); p.input('create-note', '办公室备用');
+  assert.match(p.get('create-target-hint').textContent!, /已关闭/);
+  p.click('create-ip-save'); await waitFor(() => p.state.saved === 1);
+  const c = parseConfig(p.state.text);
+  assert.equal(c.rules.office.enabled, false); assert.deepEqual(c.rules.office.ports, ['9000']);
+  assert.deepEqual(c.rules.office.allow[1], { ip: '203.0.113.88', note: '办公室备用' });
+  assert.equal(c.rules.home.allow.length, 1);
+});
+
+test('添加规则表单刷新后保留，空配置添加 IP 引导先建规则', async t => {
+  const p = await page(); t.after(p.close);
+  p.window.document.querySelector<HTMLButtonElement>('[data-view="add-rule"]')!.click();
+  await waitFor(() => !p.get('view-add-rule').hidden && !(p.get('console') as unknown as HTMLElement).inert);
+  p.input('create-name', '待完成'); p.input('create-ports', '5200'); p.input('create-sources', '192.0.2.8 家里');
+  const restored = await page(p.window.sessionStorage.getItem('portguard-draft')); t.after(restored.close);
+  assert.equal(restored.get('view-add-rule').hidden, false);
+  assert.equal((restored.get('create-name') as unknown as HTMLInputElement).value, '待完成');
+  restored.click('create-rule-save'); await waitFor(() => restored.state.saved === 1);
+  const empty = await page(null, 'protected_ports=[22]\n[rules]'); t.after(empty.close);
+  empty.window.document.querySelector<HTMLButtonElement>('[data-view="add-ip"]')!.click();
+  await waitFor(() => !empty.get('view-add-rule').hidden);
+  assert.match(empty.get('toasts').textContent!, /先添加/);
+});
+
+test('菜单可自由切换并保留表单，保存 IP 不隐式创建另一条未完成规则', async t => {
+  const p = await page(); t.after(p.close);
+  p.window.document.querySelector<HTMLButtonElement>('[data-view="add-rule"]')!.click();
+  await waitFor(() => !p.get('view-add-rule').hidden && !(p.get('console') as unknown as HTMLElement).inert);
+  p.input('create-name', 'NAS'); p.input('create-ports', '5200');
+  p.window.document.querySelector<HTMLButtonElement>('[data-view="add-ip"]')!.click();
+  await waitFor(() => !p.get('view-add-ip').hidden && !(p.get('console') as unknown as HTMLElement).inert);
+  p.input('create-target', 'office'); p.input('create-ip', '192.0.2.8'); p.input('create-note', '备用');
+  p.click('create-ip-save'); await waitFor(() => p.state.saved === 1 && !(p.get('console') as unknown as HTMLElement).inert);
+  assert.equal(Object.hasOwn(parseConfig(p.state.text).rules, 'NAS'), false);
+  assert.equal((p.get('create-name') as unknown as HTMLInputElement).value, 'NAS');
+  assert.match(p.window.sessionStorage.getItem('portguard-draft')!, /NAS/);
+  p.window.document.querySelector<HTMLButtonElement>('[data-view="add-rule"]')!.click();
+  await waitFor(() => !p.get('view-add-rule').hidden && !(p.get('console') as unknown as HTMLElement).inert);
+  p.input('create-sources', '203.0.113.25 家里'); p.click('create-rule-save');
+  await waitFor(() => p.state.saved === 2);
+  assert.deepEqual(parseConfig(p.state.text).rules.NAS.ports, ['5200']);
+});
+
+test('给全部允许的规则添加 IP，必须确认改为白名单，取消不动配置', async t => {
+  const p = await page(null, initial.replace('[{ip="192.0.2.1",note="家里"}]', '["*"]')); t.after(p.close);
+  p.window.document.querySelector<HTMLButtonElement>('[data-view="add-ip"]')!.click();
+  await waitFor(() => !p.get('view-add-ip').hidden && !(p.get('console') as unknown as HTMLElement).inert);
+  p.input('create-ip', '192.0.2.8'); p.input('create-note', '家里'); p.click('create-ip-save');
+  await waitFor(() => p.get('modal').hasAttribute('open'));
+  p.click('modal-cancel'); await waitFor(() => !(p.get('console') as unknown as HTMLElement).inert);
+  assert.equal(p.state.saved, 0);
+  assert.deepEqual(parseConfig(p.state.text).rules.home.allow, ['*']);
+  assert.equal((p.get('create-ip') as unknown as HTMLInputElement).value, '192.0.2.8');
 });
 
 test('会话过期不刷新或丢稿，重新登录恢复草稿', async t => {
