@@ -100,7 +100,7 @@ sudo portguard -c /etc/portguard/firewall.toml apply
 sudo portguard -c /etc/portguard/firewall.toml apply --watch --interval-ms 500
 ```
 
-`apply` 本身就是热载：用一次 nftables 事务替换专用表，rathole 不用重启。不加 `--watch` 时进程随即退出，适合手工执行或脚本调用。`--watch` 先应用当前文件，再按路径重新读取，编辑器原子替换也能发现；新内容必须连续两次相同才应用，避免写到一半。配置无效、校验失败或会锁死当前 SSH 端口时，只报错并保留正在生效的规则，进程继续等待下一次修改。它和单次 `apply` 使用同一把锁。`--interval-ms` 限制在 100–60000。可用 `deploy/portguard-watch.service` 开机运行；不需要持续热载时，仍用单次 `apply`。
+`apply` 本身就是热载：用一次 nftables 事务替换专用表，rathole 不用重启。不加 `--watch` 时进程随即退出，适合手工执行或脚本调用。`--watch` 先应用当前文件，再按路径重新读取，编辑器原子替换也能发现；新内容必须连续两次相同才应用，避免写到一半。配置无效、校验失败或会锁死当前 SSH 端口时，只报错并保留正在生效的规则，进程继续等待下一次修改。它和单次 `apply` 使用同一把锁。`--interval-ms` 限制在 100–60000。可用 `deploy/portguard-watch.service` 开机运行；不需要持续热载时，仍用单次 `apply`。watch 还会生成同名 `.watch.json` 状态报告，继承配置的所有者和权限，供 UI 查询最近热载结果与最后成功时间；报告缺失或过期不会被当作应用成功。
 
 辅助选项：
 

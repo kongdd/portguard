@@ -35,7 +35,13 @@ pub fn lock() -> Result<File> {
 }
 
 pub fn atomic(path: &Path, text: &str) -> Result<()> {
-    let metadata = match fs::metadata(path) {
+    atomic_like(path, text, path)
+}
+
+// Status reports must be readable by the same user as the configuration, even
+// when the watcher is root and the UI is not.
+pub fn atomic_like(path: &Path, text: &str, reference: &Path) -> Result<()> {
+    let metadata = match fs::metadata(reference) {
         Ok(metadata) => Some(metadata),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),

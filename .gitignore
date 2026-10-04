@@ -2,6 +2,7 @@
 /firewall.toml
 *.state.json
 *.pending.json
+*.watch.json
 *.tmp.*
 __pycache__/
 /UI/node_modules/

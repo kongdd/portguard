@@ -65,6 +65,12 @@ print(json.dumps({"success":True,"ip":ip,"country_code":"AU" if foreign else "CN
         return json.loads((self.root / 'kernel.json').read_text())
 
     def test_watch_applies_stable_changes_and_keeps_rules_on_invalid_edit(self):
+        self.config.chmod(0o600)
+        if os.geteuid() == 0:
+            try:
+                os.chown(self.config, 65534, 65534)
+            except PermissionError:
+                pass  # Root in a user namespace may not have this identity mapped.
         env = self.env.copy()
         env['PORTGUARD_LOCK'] = str(self.root / 'portguard.lock')
         process = subprocess.Popen([str(BINARY), '-c', str(self.config), 'apply', '--watch', '--interval-ms', '100'], env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -72,18 +78,38 @@ print(json.dumps({"success":True,"ip":ip,"country_code":"AU" if foreign else "CN
             self.wait_acl(lambda acl: '192.0.2.1/32' in acl)
             self.write(['192.0.2.8'])
             self.wait_acl(lambda acl: '192.0.2.8/32' in acl)
+            good = self.wait_watch(lambda r: '192.0.2.8' in r['applied_text'] and not r['error'])
+            status_file = Path(str(self.config) + '.watch.json')
+            self.assertEqual(status_file.stat().st_uid, self.config.stat().st_uid)
+            self.assertEqual(status_file.stat().st_mode & 0o777, 0o600)
+            self.assertIsNotNone(good['applied_at'])
             kept = self.kernel()['acl']
             self.config.write_text('this is not toml\n')
-            time.sleep(0.6)
+            failed = self.wait_watch(lambda r: '未应用' in r['error'])
+            self.assertEqual(failed['applied_text'], good['applied_text'])
+            self.assertEqual(failed['applied_at'], good['applied_at'])
             self.assertEqual(self.kernel()['acl'], kept)
             self.write(['192.0.2.9'])
             self.wait_acl(lambda acl: '192.0.2.9/32' in acl)
+            recovered = self.wait_watch(lambda r: '192.0.2.9' in r['applied_text'] and not r['error'])
+            self.assertGreaterEqual(recovered['applied_at'], good['applied_at'])
             self.assertNotIn('192.0.2.8/32', self.kernel()['acl'])
         finally:
             process.terminate()
             out, err = process.communicate(timeout=5)
         self.assertIn('未应用，防火墙保持原样', err)
         self.assertIn('已应用', out)
+
+    def wait_watch(self, predicate, timeout=5):
+        end = time.time() + timeout
+        path = Path(str(self.config) + '.watch.json')
+        while time.time() < end:
+            if path.exists():
+                report = json.loads(path.read_text())
+                if predicate(report):
+                    return report
+            time.sleep(0.05)
+        self.fail('热载报告未在时限内更新')
 
     def wait_acl(self, predicate, timeout=5):
         end = time.time() + timeout

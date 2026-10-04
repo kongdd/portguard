@@ -7,6 +7,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { parseConfig, serializeConfig, normalizeIp, type Config } from './policy.js';
 import { readJson as body, withRequestErrors } from './http.js';
+import { readWatchStatus } from './watch.js';
 import { authenticate, hashPassword, loadAuth, saveAuth, validUsername, type AuthFile, type User } from './auth.js';
 
 const exec = promisify(execFile);
@@ -108,6 +109,9 @@ createServer(withRequestErrors(async (req, res) => {
   }
   if (req.method === 'GET' && url.pathname === '/api/ip') {
     reply(res, 200, { ip }); return;
+  }
+  if (req.method === 'GET' && url.pathname === '/api/watch') {
+    reply(res, 200, await readWatchStatus(configPath)); return;
   }
   if (req.method === 'POST' && url.pathname === '/api/password') {
     const data = await body(req);

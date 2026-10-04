@@ -193,6 +193,11 @@ fn watch(store: &store::Store, session: Option<&str>, interval_ms: u64) -> Resul
     ));
     let mut seen = String::new();
     let mut reported = String::new();
+    let mut last_success = String::new();
+    let mut applied_at = None;
+    let mut last_report = (String::new(), String::new());
+    let mut last_write = 0;
+    let mut report_error = String::new();
     // Apply the file already on disk, then only react to a later stable change.
     match store.text() {
         Ok(text) => reconcile(store, session, text, &mut seen, &mut reported),
@@ -202,6 +207,28 @@ fn watch(store: &store::Store, session: Option<&str>, interval_ms: u64) -> Resul
         ),
     }
     loop {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis() as u64;
+        if !seen.is_empty() && seen != last_success {
+            applied_at = Some(now);
+            last_success.clone_from(&seen);
+        }
+        if last_report.0 != seen
+            || last_report.1 != reported
+            || now.saturating_sub(last_write) >= 5000
+        {
+            let text = serde_json::to_string(&serde_json::json!({
+                "applied_text": seen, "error": reported, "applied_at": applied_at,
+                "updated_at": now, "interval_ms": interval.as_millis(),
+            }))?;
+            match store::atomic_like(&store.side(".watch.json"), &text, &store.path) {
+                Ok(()) => report_error.clear(),
+                Err(error) => remember(&mut report_error, &format!("无法发布热载状态：{error:#}")),
+            }
+            last_report = (seen.clone(), reported.clone());
+            last_write = now;
+        }
         thread::sleep(interval);
         let text = match store.text() {
             Ok(text) => text,
@@ -213,7 +240,8 @@ fn watch(store: &store::Store, session: Option<&str>, interval_ms: u64) -> Resul
                 continue;
             }
         };
-        if text == seen {
+        if !seen.is_empty() && text == seen {
+            reported.clear();
             continue;
         }
         thread::sleep(interval);
@@ -242,7 +270,7 @@ fn reconcile(
     seen: &mut String,
     reported: &mut String,
 ) {
-    if text == *seen {
+    if !seen.is_empty() && text == *seen {
         return;
     }
     let result = (|| {

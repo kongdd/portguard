@@ -7,7 +7,8 @@ import { readJson, withRequestErrors } from './http.js';
 import { mkdtemp, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { parseConfig, serializeConfig, normalizeIp, allowIp, allowNote, setAllowNote } from './policy.js';
+import { parseConfig, serializeConfig, normalizeIp, allowIp, allowNote, setAllowNote, portError, addressError, matchesRule } from './policy.js';
+import { watchStatus } from './watch.js';
 import { authenticate, defaultAuth, hashPassword, loadAuth, saveAuth, verifyPassword, DEFAULT_PASSWORD, DEFAULT_USER } from './auth.js';
 test('配置默认值及中文、IPv6、空白名单往返', () => {
   const c = parseConfig('protected_ports=[22]\n[rules."办公室"]\nports=["5200-5300"]\nallow=["2001:db8::/64"]\n[rules.deny]\nports=["8080"]\nallow=[]');
@@ -45,6 +46,26 @@ test('备注引号和 TOML 表内容不会注入配置，未知字段保留给 C
   assert.deepEqual(parseConfig(serializeConfig(c)), c);
   Object.assign(c.rules.a.allow[0], { typo: true });
   assert.deepEqual(parseConfig(serializeConfig(c)), c);
+});
+
+test('即时校验端口和双栈 CIDR，搜索支持 IP 与备注', () => {
+  for (const value of ['0', '65536', '90-80', 'abc']) assert.ok(portError(value));
+  for (const value of ['8080', '5200-5300', '65535']) assert.equal(portError(value), '');
+  for (const value of ['999.1.2.3', '1.2.3.4/33', '2001:db8::/129', '2001:::1', '1.2.3.4/', '1.2.3.4/24/1']) assert.ok(addressError(value));
+  for (const value of ['*', '192.0.2.1/32', '2001:db8::/64', '::ffff:192.0.2.1']) assert.equal(addressError(value), '');
+  const rule = { enabled: true, ports: ['8080'], allow: [{ ip: '192.0.2.1', note: '家里 Home' }] };
+  for (const query of ['NAS', '8080', '192.0.2', '家里', 'home']) assert.ok(matchesRule('nas', rule, query));
+  assert.equal(matchesRule('nas', rule, '办公室'), false);
+});
+
+test('热载状态区分等待、成功、失败和失联，保留最后成功时间', () => {
+  const report = { updated_at: 100_000, interval_ms: 500, applied_text: 'old', applied_at: 90_000, error: '' };
+  assert.equal(watchStatus('new', report, 100_000).state, 'waiting');
+  assert.equal(watchStatus('old', report, 100_000).state, 'applied');
+  assert.equal(watchStatus('new', { ...report, error: '保护端口校验失败' }, 100_000).state, 'failed');
+  assert.equal(watchStatus('old', report, 200_000).state, 'unknown');
+  assert.equal(watchStatus('old', report, 200_000).appliedAt, 90_000);
+  assert.equal(watchStatus('new', null).state, 'unknown');
 });
 
 test('只规范 IPv4 mapped 地址', () => {
